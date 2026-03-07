@@ -30,19 +30,11 @@ bool     maxReady          = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 bool maxSetup() {
-  if (!maxSensor.begin(Wire, I2C_SPEED_STANDARD)) return false;
+  // ── Match proven working sketch exactly ─────────────────────────────────────
+  if (!maxSensor.begin(Wire, I2C_SPEED_FAST)) return false;
 
-  // sampleRate=400 is the critical fix:
-  //   400 Hz ÷ sampleAvg=4 → 100 output samples/sec
-  //   A 70 BPM systolic rise (~100 ms) spans ~10 output samples
-  //   → checkForBeat() can clearly see the slope change
-  // adcRange=4096 (was 16384): higher sensitivity per count → larger AC swing
-  maxSensor.setup(0x1F, 4, 2, 400, 411, 4096);
-
-  // Both LEDs fixed at 0x1F (~6 mA) — working sketch approach
-  maxSensor.setPulseAmplitudeRed(LED_AMPLITUDE);
-  maxSensor.setPulseAmplitudeIR(LED_AMPLITUDE);
-  maxSensor.setPulseAmplitudeGreen(0);
+  maxSensor.setup();                          // default: 0x1F, avg=4, mode=3, 400sps, 411µs, adc=4096
+  maxSensor.setPulseAmplitudeRed(0x0A);       // Red LED low — indicates sensor running
 
   // Clear buffers — loop fills them naturally once finger is placed
   memset(irBuf,  0, sizeof(irBuf));
@@ -57,16 +49,22 @@ bool maxLoop(bool &beat_out, long &ir_out) {
   beat_out = false;
   ir_out   = 0;
 
-  maxSensor.check();  // pump FIFO into library buffer
+  // Pump hardware FIFO into library sense buffer (non-blocking)
+  maxSensor.check();
 
-  // ── Read IR every loop — matches OLED sketch pattern ────────────────────────
-  // getRed() is actually the IR channel on this board (IR/RED are swapped).
-  // Evidence: serial showed RED=6130 >> IR=478 with no finger.
-  // Captured BEFORE nextSample() so the value is fresh.
-  long irValue = maxSensor.getRed();
-  ir_out = irValue;
+  // Only process when a NEW sample is available — one checkForBeat per real
+  // sample, exactly like the proven working sketch.
+  if (!maxSensor.available()) return false;
 
-  // ── Beat detection every loop — no beats missed ─────────────────────────────
+  // ── Read both channels from the SAME sample (non-blocking) ──────────────────
+  long     irValue = (long)maxSensor.getFIFOIR();    // IR channel — matches working sketch's getIR()
+  uint32_t redV    = maxSensor.getFIFORed();
+  maxSensor.nextSample();
+
+  ir_out   = irValue;
+  lastRedV = redV;
+
+  // ── Beat detection — exact same logic as proven working sketch ──────────────
   if (irValue > 7000) {
     if (checkForBeat(irValue)) {
       long delta       = millis() - lastBeat;
@@ -81,19 +79,8 @@ bool maxLoop(bool &beat_out, long &ir_out) {
         beat_out = true;
       }
     }
-  }
 
-  // ── FIFO drain: SpO2 buffer + report when new sample is ready ───────────────
-  // Print ONLY when a new sample is ready (~100×/sec with avg=4 at 400 Hz).
-  // Prevents serial flood that was corrupting FLEX/IMU lines.
-  if (!maxSensor.available()) return false;
-
-  // Swap: getIR() reads the Red channel on this board
-  uint32_t redV = maxSensor.getIR();
-  lastRedV = redV;
-  maxSensor.nextSample();
-
-  if (irValue > 7000) {
+    // ── SpO2 rolling buffer ───────────────────────────────────────────────────
     memmove(irBuf,  irBuf  + 1, (SPO2_LEN - 1) * sizeof(uint32_t));
     memmove(redBuf, redBuf + 1, (SPO2_LEN - 1) * sizeof(uint32_t));
     irBuf[SPO2_LEN  - 1] = (uint32_t)irValue;
@@ -113,8 +100,8 @@ bool maxLoop(bool &beat_out, long &ir_out) {
     }
   } else {
     // Finger removed — reset all state
-    bpmAvg       = 0;
-    rateSpot     = 0;
+    bpmAvg        = 0;
+    rateSpot      = 0;
     memset(bpmRates, 0, sizeof(bpmRates));
     lastValidSPO2 = 0;
     bufferFull    = false;
@@ -123,6 +110,5 @@ bool maxLoop(bool &beat_out, long &ir_out) {
     memset(redBuf, 0, sizeof(redBuf));
   }
 
-  // Caller prints HR line using irValue, lastRedV, bpmAvg, lastValidSPO2, beat_out
   return true;
 }
