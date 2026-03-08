@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Arduino.h>
 #include "kalman.h"
 
 // ═══════════════════════════════════════════════════════════════
@@ -21,3 +22,34 @@ int readAveraged(int pin, int n = 8);
 
 // Read a flex sensor using its own per-sensor averaging count
 int readFlex(int idx);
+
+// ═══════════════════════════════════════════════════════════════
+//  GESTURES & HAND STATE
+// ═══════════════════════════════════════════════════════════════
+enum HandPos : uint8_t { HAND_UP = 0, HAND_DOWN = 1, HAND_REST = 2 };
+extern volatile HandPos g_handPos;
+
+extern portMUX_TYPE g_flexMux;
+
+static const uint8_t G_NONE      = 0;
+static const uint8_t G_QUESTION  = 1;
+static const uint8_t G_YES       = 2;
+static const uint8_t G_NO        = 3;
+static const uint8_t G_INC_AC    = 4;
+static const uint8_t G_DEC_AC    = 5;
+static const uint8_t G_INC_LIGHT = 6;
+static const uint8_t G_DEC_LIGHT = 7;
+
+extern int  flexBaseline[5];
+extern int  flexRaw[5];
+extern int  flexKal[5];
+extern int  flexDiff[5];
+extern bool flexBent[5];
+extern uint8_t flexChangeCount[5];
+
+extern uint8_t g_stableGesture;
+extern volatile int g_gsrRaw;
+
+void calibrateFlexSensors();
+void flexTask(void *pv);
+const char* gestureToText(uint8_t g);

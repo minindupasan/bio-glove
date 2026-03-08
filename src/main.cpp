@@ -46,9 +46,11 @@
 SemaphoreHandle_t i2cMutex;
 
 // ═══════════════════════════════════════════════════════════════
-//  TIMING
+//  TIMING & CACHE
 // ═══════════════════════════════════════════════════════════════
 unsigned long tFlex = 0, tIMU = 0, tGSR = 0, tTemp = 0;
+uint32_t lastPrintMs = 0;
+float g_tempC = NAN;
 
 // ═══════════════════════════════════════════════════════════════
 //  SETUP
@@ -98,16 +100,31 @@ void setup() {
   gsrCalibrate();
   Serial.print("INFO:GSR baseline="); Serial.println(gsrBaseline);
 
-  // ── Flex sensor Kalman warmup ─────────────────────────────
-  for (int i = 0; i < 5; i++)
-    flex[i].kf.seed((float)readFlex(i));
-  for (int w = 0; w < 30; w++) {
-    for (int i = 0; i < 5; i++)
-      flex[i].kf.update((float)readFlex(i));
-    delay(10);
-  }
+  // ── Flex sensor Calibration ─────────────────────────────
+  calibrateFlexSensors();
 
   Serial.println("READY");
+
+  portENTER_CRITICAL(&g_flexMux);
+  for (int i = 0; i < 5; i++) {
+    flexBent[i] = false;
+    flexChangeCount[i] = 0;
+    flexRaw[i] = 0;
+    flexDiff[i] = 0;
+  }
+  g_gsrRaw = 0;
+  g_stableGesture = G_NONE;
+  portEXIT_CRITICAL(&g_flexMux);
+
+  xTaskCreatePinnedToCore(
+    flexTask,
+    "FlexTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    0
+  );
 
   // ── Launch MAX30102 task on Core 0 ────────────────────────
   if (maxReady) {
@@ -133,13 +150,13 @@ void loop() {
   if (now - tFlex >= 50) {
     tFlex = now;
     Serial.print("FLEX:");
+    portENTER_CRITICAL(&g_flexMux);
     for (int i = 0; i < 5; i++) {
-      int raw = readFlex(i);
-      int kal = (int)roundf(flex[i].kf.update((float)raw));
-      Serial.print(raw); Serial.print(",");
-      Serial.print(kal);
+      Serial.print(flexRaw[i]); Serial.print(",");
+      Serial.print(flexKal[i]);
       if (i < 4) Serial.print(",");
     }
+    portEXIT_CRITICAL(&g_flexMux);
     Serial.println();
   }
 
@@ -148,6 +165,15 @@ void loop() {
     tIMU = now;
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
       if (mpuRead()) {
+        // inverted mapping mapping for hand pos
+        if (!isnan(pitch)) {
+          if (pitch < -20.0f)         g_handPos = HAND_DOWN;
+          else if (pitch > 20.0f)     g_handPos = HAND_UP;
+          else                        g_handPos = HAND_REST;
+        }
+        
+        // Print IMU format for Processing Dashboard:
+        // IMU:ax,ay,az,gx,gy,gz,roll,pitch,yaw
         Serial.printf("IMU:%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
           accX, accY, accZ, gyX, gyY, gyZ, roll, pitch, yaw);
       }
@@ -155,32 +181,8 @@ void loop() {
     }
   }
 
-  // ── GSR @ 10 Hz ───────────────────────────────────────────
-  if (now - tGSR >= 100) {
-    tGSR = now;
-    int raw = readAveraged(GSR_PIN, 10);
-    int kal = (int)roundf(gsrKF.update((float)raw));
-    float voltage = raw * (3.3f / 4095.0f);
-    int   change  = raw - gsrBaseline;
-    bool  spike   = (change < -200);
-    Serial.printf("GSR:%d,%d,%.3f,%d,%d\n",
-      raw, kal, voltage, change, spike ? 1 : 0);
-  }
-
-  // ── MAX30102 ──────────────────────────────────────────────
-  if (maxReady) {
-    if (outBeat) { // Flag is true if beat was hit recently
-      outBeat = false; // Consume pulse
-      Serial.printf("HR:%ld,%lu,%d,%d,%d,%d\n",
-        outIR, lastRedV, outBPM, lastValidSPO2, 1, LED_AMPLITUDE);
-    } else if (now % 100 == 0) { // Stream non-beat state less often (like 10Hz)
-      Serial.printf("HR:%ld,%lu,%d,%d,%d,%d\n",
-        outIR, lastRedV, outBPM, lastValidSPO2, 0, LED_AMPLITUDE);
-    }
-  }
-
-  // ── TEMP @ 4 Hz ───────────────────────────────────────────
-  if (maxReady && now - tTemp >= 250) {
+  // ── TEMP @ 2 Hz ───────────────────────────────────────────
+  if (maxReady && now - tTemp >= 500) {
     tTemp = now;
     float c = -999.0f;
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
@@ -188,16 +190,78 @@ void loop() {
       xSemaphoreGive(i2cMutex);
     }
     
-    if (c > -100.0f) {
-      float f = c * 9.0f / 5.0f + 32.0f;
-      const char* st =
-        c < 20.0f ? "SENSOR_ERROR" :
-        c < 30.0f ? "NO_CONTACT"   :
-        c < 34.0f ? "COLD_SKIN"    :
-        c < 36.0f ? "COOL_SKIN"    :
-        c < 37.5f ? "NORMAL"       :
-        c < 38.5f ? "WARM"         : "FEVER";
-      Serial.printf("TEMP:%.3f,%.3f,%s\n", c, f, st);
+    if (c > -100.0f) { // Valid temp
+       g_tempC = c;
     }
+  }
+
+  // ── Serial Output @ 10 Hz ───────────────────────────────────────────
+  if (now - lastPrintMs >= 100) {
+    lastPrintMs = now;
+
+    bool bentLocal[5];
+    int  diffLocal[5];
+    uint8_t stableGestureLocal;
+    int gsrRawLocal;
+
+    // Read globals atomically
+    portENTER_CRITICAL(&g_flexMux);
+    for (int i = 0; i < 5; i++) {
+      bentLocal[i] = flexBent[i];
+      diffLocal[i] = flexDiff[i];
+    }
+    stableGestureLocal = g_stableGesture;
+    gsrRawLocal = g_gsrRaw;
+    portEXIT_CRITICAL(&g_flexMux);
+
+    HandPos hp = g_handPos;
+    const char* handStr = (hp == HAND_UP) ? "UP" : (hp == HAND_DOWN) ? "DOWN" : "REST";
+    const char* gestureTxt = gestureToText(stableGestureLocal);
+
+    Serial.print("HAND=");
+    Serial.print(handStr);
+
+    // Our array map: Ring=0, Thumb=1, Middle=2, Pinky=3, Index=4
+    // User format request: T I M R
+    Serial.print("  FLEX[T I M R]=");
+    Serial.print(bentLocal[1] ? "B(" : "N("); Serial.print(diffLocal[1]); Serial.print(") "); // Thumb
+    Serial.print(bentLocal[4] ? "B(" : "N("); Serial.print(diffLocal[4]); Serial.print(") "); // Index
+    Serial.print(bentLocal[2] ? "B(" : "N("); Serial.print(diffLocal[2]); Serial.print(") "); // Middle
+    Serial.print(bentLocal[0] ? "B(" : "N("); Serial.print(diffLocal[0]); Serial.print(")");  // Ring
+
+    Serial.print("  GSR=");
+    Serial.print(gsrRawLocal);
+
+    Serial.print("  TEMP=");
+    if (isnan(g_tempC)) Serial.print("NA");
+    else Serial.print(g_tempC, 2);
+    Serial.print("C");
+
+    Serial.print("  BPM=");
+    Serial.print(outBPM);
+    Serial.print(" SPO2=");
+    Serial.print(lastValidSPO2);
+
+    Serial.print("  GESTURE=");
+    Serial.println(gestureTxt);
+
+    // New format for Processing parser
+    Serial.print("GESTURE:");
+    Serial.println(gestureTxt);
+
+    // RESTORE DASHBOARD DATA STREAMS:
+    // TEMP:34.188,93.537,COOL_SKIN
+    if (!isnan(g_tempC)) {
+      Serial.printf("TEMP:%.3f,%.3f,OK\n", g_tempC, g_tempC * 1.8f + 32.0f);
+    }
+    
+    // GSR:raw,kal,voltage,change,spike
+    float vGSR = gsrRawLocal * (3.3f / 4095.0f);
+    Serial.printf("GSR:%d,%d,%.3f,0,0\n", gsrRawLocal, gsrRawLocal, vGSR);
+    
+    // HR:ir,red,bpm,spo2,beat,led_amp
+    Serial.printf("HR:%ld,0,%d,%d,%d,31\n", outIR, outBPM, lastValidSPO2, outBeat ? 1 : 0);
+
+    if (outBeat) outBeat = false; // consume
   }
 }

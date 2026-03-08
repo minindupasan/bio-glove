@@ -18,11 +18,19 @@ import processing.serial.*;
 final String COM_PORT  = "/dev/ttyACM0";  // Linux: /dev/ttyACM0  Windows: COM3  Mac: /dev/tty.usbmodem*
 final int    BAUD_RATE = 115200;
 
+// ═══════════════════════════════════════════════════════════════
+//  GLOBAL STATE
+// ═══════════════════════════════════════════════════════════════
 Serial  port;
 boolean portOpen = false;
 boolean espReady = false;
 String  statusMsg = "Waiting for ESP32-S3...";
 int     totalPackets = 0;
+String  sysGesture = "-";
+
+int     recGestureId = 0;
+boolean isRecording = false;
+PrintWriter logFile;
 
 // ═══════════════════════════════════════════════════════════════
 //  FLEX SENSOR DATA
@@ -136,8 +144,10 @@ int[][] BTNS = {
   {PAD+320, HDR_H+8, 120, BTN_H-16},  // 2 CAL GSR
   {PAD+450, HDR_H+8, 120, BTN_H-16},  // 3 ZERO YAW
   {PAD+580, HDR_H+8, 140, BTN_H-16},  // 4 CLEAR HIST
+  {PAD+730, HDR_H+8, 110, BTN_H-16},  // 5 GEST ID
+  {PAD+850, HDR_H+8, 110, BTN_H-16},  // 6 REC
 };
-String[] BTN_LABELS = {"SET REST","SET BEND","CAL GSR","ZERO YAW","CLEAR HIST"};
+String[] BTN_LABELS = {"SET REST","SET BEND","CAL GSR","ZERO YAW","CLEAR HIST", "GEST. ID: 0", "REC START"};
 color[]  BTN_COLORS;  // set in setup after GSR_C etc initialised
 
 // ═══════════════════════════════════════════════════════════════
@@ -150,7 +160,8 @@ void setup() {
   fSm   = createFont("Monospaced",      11, true);
   fTiny = createFont("Monospaced",       9, true);
   BTN_COLORS = new color[]{
-    color(0,200,120), color(60,140,255), GSR_C, IMU_C, color(120,130,150)
+    color(0,200,120), color(60,140,255), GSR_C, IMU_C, color(120,130,150),
+    color(200,160,40), color(60,140,255)
   };
   clearHistories();
   try {
@@ -160,7 +171,7 @@ void setup() {
     statusMsg = "Port open — waiting for READY...";
   } catch (Exception e) {
     portOpen  = false;
-    statusMsg = "✖ Cannot open " + COM_PORT + " — check port";
+    statusMsg = "✖ Port Busy: Close VS Code / PlatformIO Serial Monitor first!";
   }
 }
 
@@ -175,62 +186,92 @@ void serialEvent(Serial p) {
   }
   totalPackets++;
 
-  if (line.startsWith("FLEX:")) {
-    String[] t = split(line.substring(5), ',');
-    if (t.length >= 10) {
-      for (int i = 0; i < 5; i++) {
-        fxRaw[i] = int(t[i*2]);
-        fxKal[i] = int(t[i*2+1]);
-        hfRaw[i][hHead] = fxRaw[i];
-        hfKal[i][hHead] = fxKal[i];
+  try {
+    if (line.startsWith("FLEX:")) {
+      String[] t = split(line.substring(5), ',');
+      if (t.length >= 10) {
+        for (int i = 0; i < 5; i++) {
+          fxRaw[i] = int(t[i*2]);
+          fxKal[i] = int(t[i*2+1]);
+          hfRaw[i][hHead] = fxRaw[i];
+          hfKal[i][hHead] = fxKal[i];
+        }
+        if (capType >= 0) {
+          for (int i = 0; i < 5; i++) capSum[i] += fxKal[i];
+          capCount++;
+        }
+        
+        if (isRecording && logFile != null) {
+          logFile.println(millis() + "," + recGestureId + "," +
+            fxRaw[0] + "," + fxKal[0] + "," +
+            fxRaw[1] + "," + fxKal[1] + "," +
+            fxRaw[2] + "," + fxKal[2] + "," +
+            fxRaw[3] + "," + fxKal[3] + "," +
+            fxRaw[4] + "," + fxKal[4] + "," +
+            imuAx+ "," +imuAy+ "," +imuAz+ "," +
+            imuGx+ "," +imuGy+ "," +imuGz+ "," +
+            imuRoll+ "," +imuPitch+ "," +imuYaw+ "," + gsrRaw);
+        }
+        
+        // Zero-Order Hold Graph Advance (20 Hz)
+        int nextH = (hHead + 1) % HIST;
+        for (int i=0;i<5;i++) { hfRaw[i][nextH]=hfRaw[i][hHead]; hfKal[i][nextH]=hfKal[i][hHead]; }
+        hiRoll[nextH]=hiRoll[hHead]; hiPitch[nextH]=hiPitch[hHead]; hiYaw[nextH]=hiYaw[hHead];
+        hgRaw[nextH]=hgRaw[hHead]; hgKal[nextH]=hgKal[hHead];
+        hBPM[nextH]=hBPM[hHead]; hSPO2[nextH]=hSPO2[hHead];
+        hIR[nextH]=hIR[hHead]; hRED[nextH]=hRED[hHead]; hBeat[nextH]=0; // clear bit automatically
+        hTemp[nextH]=hTemp[hHead];
+        hHead = nextH;
       }
-      if (capType >= 0) {
-        for (int i = 0; i < 5; i++) capSum[i] += fxKal[i];
-        capCount++;
+      return;
+    }
+    if (line.startsWith("IMU:")) {
+      String[] t = split(line.substring(4), ',');
+      if (t.length >= 9) {
+        imuAx=float(t[0]); imuAy=float(t[1]); imuAz=float(t[2]);
+        imuGx=float(t[3]); imuGy=float(t[4]); imuGz=float(t[5]);
+        imuRoll=float(t[6]); imuPitch=float(t[7]); imuYaw=float(t[8])-yawOffset;
+        hiRoll[hHead]=imuRoll; hiPitch[hHead]=imuPitch; hiYaw[hHead]=imuYaw;
       }
+      return;
     }
-    return;
-  }
-  if (line.startsWith("IMU:")) {
-    String[] t = split(line.substring(4), ',');
-    if (t.length >= 9) {
-      imuAx=float(t[0]); imuAy=float(t[1]); imuAz=float(t[2]);
-      imuGx=float(t[3]); imuGy=float(t[4]); imuGz=float(t[5]);
-      imuRoll=float(t[6]); imuPitch=float(t[7]); imuYaw=float(t[8])-yawOffset;
-      hiRoll[hHead]=imuRoll; hiPitch[hHead]=imuPitch; hiYaw[hHead]=imuYaw;
+    if (line.startsWith("GSR:")) {
+      String[] t = split(line.substring(4), ',');
+      if (t.length >= 5) {
+        gsrRaw=int(t[0]); gsrKal=int(t[1]); gsrVoltage=float(t[2]);
+        gsrChange=int(t[3]); gsrSpike=t[4].equals("1");
+        hgRaw[hHead]=gsrRaw; hgKal[hHead]=gsrKal;
+      }
+      return;
     }
-    return;
-  }
-  if (line.startsWith("GSR:")) {
-    String[] t = split(line.substring(4), ',');
-    if (t.length >= 5) {
-      gsrRaw=int(t[0]); gsrKal=int(t[1]); gsrVoltage=float(t[2]);
-      gsrChange=int(t[3]); gsrSpike=t[4].equals("1");
-      hgRaw[hHead]=gsrRaw; hgKal[hHead]=gsrKal;
+    if (line.startsWith("HR:")) {
+      String[] t = split(line.substring(3), ',');
+      if (t.length >= 5) {
+        hrIR=int(t[0]); hrRed=int(t[1]); hrBPM=int(t[2]); hrSPO2=int(t[3]);
+        hrBeat=t[4].equals("1");
+        if (t.length>=6) hrLED=int(t[5]);
+        if (hrBeat) beatFlashTimer=millis();
+        if (hrBPM>0) lastBPM=hrBPM;
+        hBPM[hHead]=hrBPM; hSPO2[hHead]=hrSPO2;
+        hIR[hHead]=hrIR; hRED[hHead]=hrRed; hBeat[hHead]=hrBeat?1:0;
+      }
+      return;
     }
-    return;
-  }
-  if (line.startsWith("HR:")) {
-    String[] t = split(line.substring(3), ',');
-    if (t.length >= 5) {
-      hrIR=int(t[0]); hrRed=int(t[1]); hrBPM=int(t[2]); hrSPO2=int(t[3]);
-      hrBeat=t[4].equals("1");
-      if (t.length>=6) hrLED=int(t[5]);
-      if (hrBeat) beatFlashTimer=millis();
-      if (hrBPM>0) lastBPM=hrBPM;
-      hBPM[hHead]=hrBPM; hSPO2[hHead]=hrSPO2;
-      hIR[hHead]=hrIR; hRED[hHead]=hrRed; hBeat[hHead]=hrBeat?1:0;
+    if (line.startsWith("TEMP:")) {
+      String[] t = split(line.substring(5), ',');
+      if (t.length >= 3) {
+        tempC=float(t[0]); tempF=float(t[1]); tempStatus=t[2];
+        hTemp[hHead]=tempC;
+      }
+      return;
     }
-    return;
-  }
-  if (line.startsWith("TEMP:")) {
-    String[] t = split(line.substring(5), ',');
-    if (t.length >= 3) {
-      tempC=float(t[0]); tempF=float(t[1]); tempStatus=t[2];
-      hTemp[hHead]=tempC;
-      hHead = (hHead+1) % HIST;
+    if (line.startsWith("GESTURE:")) {
+      sysGesture = line.substring(8).trim();
+      return;
     }
-    return;
+  } catch (Exception e) {
+    // Silently drop corrupt serial payload packets to keep dashboard alive
+    // Console output for debugging: println("Parse Error: " + line);
   }
 }
 
@@ -299,6 +340,17 @@ void drawHeader() {
   text("BIOSENSOR GLOVE", 16, HDR_H/2-2);
   fill(THDIM); textSize(10);
   text("FLEX × 5  |  MPU6050  |  GSR  |  MAX30102  |  CJMCU-30205", 16, HDR_H/2+10);
+
+  // GESTURE READOUT
+  fill(BORDER); noStroke(); rect(320, 10, 300, 32, 5);
+  if (!sysGesture.equals("-")) {
+    fill(color(0, 220, 140)); textFont(fMed); textSize(16); textAlign(CENTER, CENTER);
+    text(sysGesture.toUpperCase(), 320 + 300/2, HDR_H/2);
+  } else {
+    fill(THDIM); textFont(fSm); textSize(12); textAlign(CENTER, CENTER);
+    text("NO GESTURE", 320 + 300/2, HDR_H/2);
+  }
+
   fill(espReady ? color(0,220,130,40) : color(255,100,50,40));
   noStroke(); rect(W-600,10,590,32,5);
   fill(espReady ? color(0,230,140) : color(255,120,60));
@@ -315,14 +367,18 @@ void drawButtonBar() {
   line(0, HDR_H, W, HDR_H);
   line(0, HDR_H+BTN_H-1, W, HDR_H+BTN_H-1);
 
+  BTN_LABELS[5] = "GEST. ID: " + recGestureId;
+  BTN_LABELS[6] = isRecording ? "REC STOP" : "REC START";
+  BTN_COLORS[6] = isRecording ? color(255, 60, 80) : color(60, 140, 255);
+
   for (int b = 0; b < BTNS.length; b++) {
-    boolean active = (b==0 && capType==0) || (b==1 && capType==1);
+    boolean active = (b==0 && capType==0) || (b==1 && capType==1) || (b==6 && isRecording);
     int[] btn = BTNS[b];
     drawButton(btn[0], btn[1], btn[2], btn[3], BTN_LABELS[b], BTN_COLORS[b], active);
   }
 
   // Progress bar or hint
-  int hinX = PAD+740;
+  int hinX = PAD+980;
   if (capType >= 0 && capCount > 0) {
     float prog = constrain(capCount/(float)CAP_N, 0, 1);
     int bw = 290;
@@ -368,6 +424,19 @@ void mousePressed() {
   if (btnHit(mouseX, mouseY, 2)) gsrBaseline = gsrRaw;   // CAL GSR
   if (btnHit(mouseX, mouseY, 3)) yawOffset += imuYaw;    // ZERO YAW
   if (btnHit(mouseX, mouseY, 4)) clearHistories();       // CLEAR HIST
+  if (btnHit(mouseX, mouseY, 5)) {  // GEST ID
+    recGestureId = (recGestureId + 1) % 10;
+  }
+  if (btnHit(mouseX, mouseY, 6)) {  // REC TOGGLE
+    isRecording = !isRecording;
+    if (isRecording) {
+      String fname = "gesture_" + recGestureId + "_" + month() + day() + "_" + hour() + minute() + second() + ".csv";
+      logFile = createWriter(fname);
+      logFile.println("timestamp_ms,gesture_id,r_raw,r_kal,t_raw,t_kal,m_raw,m_kal,p_raw,p_kal,i_raw,i_kal,imu_ax,imu_ay,imu_az,imu_gx,imu_gy,imu_gz,roll,pitch,yaw,gsr_raw");
+    } else {
+      if (logFile != null) { logFile.flush(); logFile.close(); logFile = null; }
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
