@@ -41,6 +41,11 @@
 #include "max30102.h"
 
 // ═══════════════════════════════════════════════════════════════
+//  FREE RTOS
+// ═══════════════════════════════════════════════════════════════
+SemaphoreHandle_t i2cMutex;
+
+// ═══════════════════════════════════════════════════════════════
 //  TIMING
 // ═══════════════════════════════════════════════════════════════
 unsigned long tFlex = 0, tIMU = 0, tGSR = 0, tTemp = 0;
@@ -57,24 +62,35 @@ void setup() {
   analogSetAttenuation(ADC_11db);
 
   // I2C
+  i2cMutex = xSemaphoreCreateMutex();
+  if (i2cMutex == NULL) {
+    Serial.println("WARN: Failed to create I2C Mutex");
+  }
+
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
   delay(200);
 
   // ── MPU6050 init ──────────────────────────────────────────
-  mpuWrite(0x6B, 0x00);  // wake up
-  mpuWrite(0x1C, 0x00);  // accel ±2g
-  mpuWrite(0x1B, 0x00);  // gyro ±250°/s
-  delay(100);
-  Serial.println("INFO:Calibrating MPU6050 gyro (keep still)...");
-  mpuCalibrate();
-  Serial.println("INFO:MPU6050 ready");
+  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+    mpuWrite(0x6B, 0x00);  // wake up
+    mpuWrite(0x1C, 0x00);  // accel ±2g
+    mpuWrite(0x1B, 0x00);  // gyro ±250°/s
+    delay(100);
+    Serial.println("INFO:Calibrating MPU6050 gyro (keep still)...");
+    mpuCalibrate();
+    Serial.println("INFO:MPU6050 ready");
+    xSemaphoreGive(i2cMutex);
+  }
 
   // ── MAX30102 init ─────────────────────────────────────────
-  if (maxSetup()) {
-    Serial.println("INFO:MAX30102 ready");
-  } else {
-    Serial.println("WARN:MAX30102 not found");
+  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+    if (maxSetup()) {
+      Serial.println("INFO:MAX30102 ready");
+    } else {
+      Serial.println("WARN:MAX30102 not found");
+    }
+    xSemaphoreGive(i2cMutex);
   }
 
   // ── GSR baseline ─────────────────────────────────────────
@@ -92,6 +108,19 @@ void setup() {
   }
 
   Serial.println("READY");
+
+  // ── Launch MAX30102 task on Core 0 ────────────────────────
+  if (maxReady) {
+    xTaskCreatePinnedToCore(
+      maxTask,      // Function
+      "maxTask",    // Name
+      4096,         // Stack size
+      NULL,         // Parameters
+      2,            // Priority
+      NULL,         // Handle
+      0             // Core 0 (default Arduino loop is Core 1)
+    );
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -117,9 +146,12 @@ void loop() {
   // ── IMU @ 20 Hz ───────────────────────────────────────────
   if (now - tIMU >= 50) {
     tIMU = now;
-    if (mpuRead()) {
-      Serial.printf("IMU:%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
-        accX, accY, accZ, gyX, gyY, gyZ, roll, pitch, yaw);
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+      if (mpuRead()) {
+        Serial.printf("IMU:%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
+          accX, accY, accZ, gyX, gyY, gyZ, roll, pitch, yaw);
+      }
+      xSemaphoreGive(i2cMutex);
     }
   }
 
@@ -137,28 +169,35 @@ void loop() {
 
   // ── MAX30102 ──────────────────────────────────────────────
   if (maxReady) {
-    bool beat    = false;
-    long irValue = 0;
-    if (maxLoop(beat, irValue)) {
-      // HR:ir,red,bpm,spo2,beat,led_amp  — ~100×/sec at 400 Hz ÷ avg 4
-      // irValue is captured inside maxLoop BEFORE nextSample() advances the FIFO.
+    if (outBeat) { // Flag is true if beat was hit recently
+      outBeat = false; // Consume pulse
       Serial.printf("HR:%ld,%lu,%d,%d,%d,%d\n",
-        irValue, lastRedV, bpmAvg, lastValidSPO2, beat ? 1 : 0, LED_AMPLITUDE);
+        outIR, lastRedV, outBPM, lastValidSPO2, 1, LED_AMPLITUDE);
+    } else if (now % 100 == 0) { // Stream non-beat state less often (like 10Hz)
+      Serial.printf("HR:%ld,%lu,%d,%d,%d,%d\n",
+        outIR, lastRedV, outBPM, lastValidSPO2, 0, LED_AMPLITUDE);
     }
   }
 
   // ── TEMP @ 4 Hz ───────────────────────────────────────────
   if (maxReady && now - tTemp >= 250) {
     tTemp = now;
-    float c = maxReadTemperature();
-    float f = c * 9.0f / 5.0f + 32.0f;
-    const char* st =
-      c < 20.0f ? "SENSOR_ERROR" :
-      c < 30.0f ? "NO_CONTACT"   :
-      c < 34.0f ? "COLD_SKIN"    :
-      c < 36.0f ? "COOL_SKIN"    :
-      c < 37.5f ? "NORMAL"       :
-      c < 38.5f ? "WARM"         : "FEVER";
-    Serial.printf("TEMP:%.3f,%.3f,%s\n", c, f, st);
+    float c = -999.0f;
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+      c = maxReadTemperature();
+      xSemaphoreGive(i2cMutex);
+    }
+    
+    if (c > -100.0f) {
+      float f = c * 9.0f / 5.0f + 32.0f;
+      const char* st =
+        c < 20.0f ? "SENSOR_ERROR" :
+        c < 30.0f ? "NO_CONTACT"   :
+        c < 34.0f ? "COLD_SKIN"    :
+        c < 36.0f ? "COOL_SKIN"    :
+        c < 37.5f ? "NORMAL"       :
+        c < 38.5f ? "WARM"         : "FEVER";
+      Serial.printf("TEMP:%.3f,%.3f,%s\n", c, f, st);
+    }
   }
 }
