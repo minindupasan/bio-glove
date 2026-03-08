@@ -13,6 +13,10 @@
 // ╚══════════════════════════════════════════════════════════════╝
 
 import processing.serial.*;
+import java.io.FileWriter;
+import java.io.BufferedWriter;
+import java.io.PrintWriter;
+import java.io.File;
 
 // !! SET YOUR PORT !!
 final String COM_PORT  = "/dev/ttyACM0";  // Linux: /dev/ttyACM0  Windows: COM3  Mac: /dev/tty.usbmodem*
@@ -28,9 +32,9 @@ String  statusMsg = "Waiting for ESP32-S3...";
 int     totalPackets = 0;
 String  sysGesture = "-";
 
-int     recGestureId = 0;
-boolean isRecording = false;
-PrintWriter logFile;
+int     studentId = 1;
+
+int     recFlashTimer = 0;
 
 // ═══════════════════════════════════════════════════════════════
 //  FLEX SENSOR DATA
@@ -143,11 +147,12 @@ int[][] BTNS = {
   {PAD+160, HDR_H+8, 150, BTN_H-16},  // 1 SET BEND
   {PAD+320, HDR_H+8, 120, BTN_H-16},  // 2 CAL GSR
   {PAD+450, HDR_H+8, 120, BTN_H-16},  // 3 ZERO YAW
-  {PAD+580, HDR_H+8, 140, BTN_H-16},  // 4 CLEAR HIST
-  {PAD+730, HDR_H+8, 110, BTN_H-16},  // 5 GEST ID
-  {PAD+850, HDR_H+8, 110, BTN_H-16},  // 6 REC
+  {PAD+580, HDR_H+8, 120, BTN_H-16},  // 4 CLEAR HIST
+  {PAD+720, HDR_H+8, 60, BTN_H-16},   // 5 ID -
+  {PAD+790, HDR_H+8, 60, BTN_H-16},   // 6 ID +
+  {PAD+860, HDR_H+8, 120, BTN_H-16},  // 7 REC
 };
-String[] BTN_LABELS = {"SET REST","SET BEND","CAL GSR","ZERO YAW","CLEAR HIST", "GEST. ID: 0", "REC START"};
+String[] BTN_LABELS = {"SET REST","SET BEND","CAL GSR","ZERO YAW","CLEAR HIST", "ID -", "ID +", "REC"};
 color[]  BTN_COLORS;  // set in setup after GSR_C etc initialised
 
 // ═══════════════════════════════════════════════════════════════
@@ -161,7 +166,7 @@ void setup() {
   fTiny = createFont("Monospaced",       9, true);
   BTN_COLORS = new color[]{
     color(0,200,120), color(60,140,255), GSR_C, IMU_C, color(120,130,150),
-    color(200,160,40), color(60,140,255)
+    color(100,110,130), color(100,110,130), color(255,80,80)
   };
   clearHistories();
   try {
@@ -199,18 +204,6 @@ void serialEvent(Serial p) {
         if (capType >= 0) {
           for (int i = 0; i < 5; i++) capSum[i] += fxKal[i];
           capCount++;
-        }
-        
-        if (isRecording && logFile != null) {
-          logFile.println(millis() + "," + recGestureId + "," +
-            fxRaw[0] + "," + fxKal[0] + "," +
-            fxRaw[1] + "," + fxKal[1] + "," +
-            fxRaw[2] + "," + fxKal[2] + "," +
-            fxRaw[3] + "," + fxKal[3] + "," +
-            fxRaw[4] + "," + fxKal[4] + "," +
-            imuAx+ "," +imuAy+ "," +imuAz+ "," +
-            imuGx+ "," +imuGy+ "," +imuGz+ "," +
-            imuRoll+ "," +imuPitch+ "," +imuYaw+ "," + gsrRaw);
         }
         
         // Zero-Order Hold Graph Advance (20 Hz)
@@ -367,18 +360,26 @@ void drawButtonBar() {
   line(0, HDR_H, W, HDR_H);
   line(0, HDR_H+BTN_H-1, W, HDR_H+BTN_H-1);
 
-  BTN_LABELS[5] = "GEST. ID: " + recGestureId;
-  BTN_LABELS[6] = isRecording ? "REC STOP" : "REC START";
-  BTN_COLORS[6] = isRecording ? color(255, 60, 80) : color(60, 140, 255);
-
   for (int b = 0; b < BTNS.length; b++) {
-    boolean active = (b==0 && capType==0) || (b==1 && capType==1) || (b==6 && isRecording);
+    boolean active = (b==0 && capType==0) || (b==1 && capType==1);
     int[] btn = BTNS[b];
-    drawButton(btn[0], btn[1], btn[2], btn[3], BTN_LABELS[b], BTN_COLORS[b], active);
+    String label = BTN_LABELS[b];
+    color c = BTN_COLORS[b];
+    
+    if (b == 7 && millis() - recFlashTimer < 300) {
+       label = "SAVED!";
+       c = color(255, 255, 255);
+       active = true;
+    }
+    
+    drawButton(btn[0], btn[1], btn[2], btn[3], label, c, active);
   }
 
+  fill(THHI); textFont(fMed); textAlign(CENTER, CENTER);
+  text("STU ID " + studentId, PAD+1050, HDR_H + BTN_H/2 - 2);
+
   // Progress bar or hint
-  int hinX = PAD+980;
+  int hinX = PAD+1130;
   if (capType >= 0 && capCount > 0) {
     float prog = constrain(capCount/(float)CAP_N, 0, 1);
     int bw = 290;
@@ -424,18 +425,36 @@ void mousePressed() {
   if (btnHit(mouseX, mouseY, 2)) gsrBaseline = gsrRaw;   // CAL GSR
   if (btnHit(mouseX, mouseY, 3)) yawOffset += imuYaw;    // ZERO YAW
   if (btnHit(mouseX, mouseY, 4)) clearHistories();       // CLEAR HIST
-  if (btnHit(mouseX, mouseY, 5)) {  // GEST ID
-    recGestureId = (recGestureId + 1) % 10;
+  if (btnHit(mouseX, mouseY, 5)) {  // ID -
+    if (studentId > 1) studentId--;
   }
-  if (btnHit(mouseX, mouseY, 6)) {  // REC TOGGLE
-    isRecording = !isRecording;
-    if (isRecording) {
-      String fname = "gesture_" + recGestureId + "_" + month() + day() + "_" + hour() + minute() + second() + ".csv";
-      logFile = createWriter(fname);
-      logFile.println("timestamp_ms,gesture_id,r_raw,r_kal,t_raw,t_kal,m_raw,m_kal,p_raw,p_kal,i_raw,i_kal,imu_ax,imu_ay,imu_az,imu_gx,imu_gy,imu_gz,roll,pitch,yaw,gsr_raw");
-    } else {
-      if (logFile != null) { logFile.flush(); logFile.close(); logFile = null; }
+  if (btnHit(mouseX, mouseY, 6)) {  // ID +
+    studentId++;
+  }
+  if (btnHit(mouseX, mouseY, 7)) {  // REC
+    recordSingleDataPoint();
+  }
+}
+
+void recordSingleDataPoint() {
+  String csvFilename = sketchPath("student_" + studentId + ".csv");
+  try {
+    File f = new File(csvFilename);
+    boolean writeHeader = !f.exists() || f.length() == 0;
+    FileWriter fw = new FileWriter(f, true);
+    BufferedWriter bw = new BufferedWriter(fw);
+    PrintWriter csvWriter = new PrintWriter(bw);
+    if (writeHeader) {
+      csvWriter.println("timestamp,BPM,SPO2,GSR_RAW,GSR_KAL,GSR_VOLTAGE,IR,RED,SKIN_TEMP_C,SKIN_TEMP_F");
     }
+    String timestamp = year()+"-"+nf(month(),2)+"-"+nf(day(),2)+" "+nf(hour(),2)+":"+nf(minute(),2)+":"+nf(second(),2)+"."+nf(millis()%1000,3);
+    csvWriter.println(timestamp + "," + hrBPM + "," + hrSPO2 + "," + gsrRaw + "," + gsrKal + "," + gsrVoltage + "," + hrIR + "," + hrRed + "," + tempC + "," + tempF);
+    csvWriter.flush();
+    csvWriter.close();
+    recFlashTimer = millis();
+    println("Recorded single snapshot for student " + studentId);
+  } catch (Exception e) {
+    println("Error appending to CSV: " + e.getMessage());
   }
 }
 
