@@ -112,3 +112,9 @@ bool maxLoop(bool &beat_out, long &ir_out) {
 
   return true;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+float maxReadTemperature() {
+  if (!maxReady) return -999.0f;
+  return maxSensor.readTemperature();
+}

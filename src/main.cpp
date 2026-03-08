@@ -39,7 +39,6 @@
 #include "mpu6050.h"
 #include "gsr.h"
 #include "max30102.h"
-#include "temp30205.h"
 
 // ═══════════════════════════════════════════════════════════════
 //  TIMING
@@ -70,13 +69,6 @@ void setup() {
   Serial.println("INFO:Calibrating MPU6050 gyro (keep still)...");
   mpuCalibrate();
   Serial.println("INFO:MPU6050 ready");
-
-  // ── CJMCU-30205 init ─────────────────────────────────────
-  if (tempInit()) {
-    Serial.println("INFO:CJMCU-30205 ready at 0x4C");
-  } else {
-    Serial.println("WARN:CJMCU-30205 not found");
-  }
 
   // ── MAX30102 init ─────────────────────────────────────────
   if (maxSetup()) {
@@ -156,9 +148,9 @@ void loop() {
   }
 
   // ── TEMP @ 4 Hz ───────────────────────────────────────────
-  if (tempReady && now - tTemp >= 250) {
+  if (maxReady && now - tTemp >= 250) {
     tTemp = now;
-    float c = readTempC();
+    float c = maxReadTemperature();
     float f = c * 9.0f / 5.0f + 32.0f;
     const char* st =
       c < 20.0f ? "SENSOR_ERROR" :

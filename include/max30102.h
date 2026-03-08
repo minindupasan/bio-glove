@@ -44,3 +44,6 @@ bool maxSetup();
 // beat_out : set true if a beat was detected this call.
 // ir_out   : the IR value that was used for beat detection (captured before nextSample()).
 bool maxLoop(bool &beat_out, long &ir_out);
+
+// Reads temperature from the MAX30102 die in Celsius.
+float maxReadTemperature();
