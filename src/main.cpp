@@ -33,12 +33,15 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #include "kalman.h"
 #include "flex_sensor.h"
 #include "mpu6050.h"
 #include "gsr.h"
 #include "max30102.h"
+#include "firebase_rtdb.h"
 
 // ═══════════════════════════════════════════════════════════════
 //  FREE RTOS
@@ -56,6 +59,8 @@ float g_tempC = NAN;
 //  SETUP
 // ═══════════════════════════════════════════════════════════════
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout (WiFi current spike)
+
   Serial.begin(115200);
   delay(1200);
 
@@ -138,6 +143,17 @@ void setup() {
       0             // Core 0 (default Arduino loop is Core 1)
     );
   }
+
+  // ── Launch Firebase task on Core 0 ──────────────────────
+  xTaskCreatePinnedToCore(
+    firebaseTask,   // Function
+    "firebaseTask", // Name
+    8192,           // Stack size (HTTPS needs headroom)
+    NULL,           // Parameters
+    1,              // Priority
+    NULL,           // Handle
+    0               // Core 0
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════

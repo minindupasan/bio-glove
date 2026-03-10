@@ -1,0 +1,21 @@
+{
+  "ROS2.distro": "jazzy",
+  "python.autoComplete.extraPaths": [
+    "/home/minindu/hexapod_ws/install/prowler_description/lib/python3.12/site-packages",
+    "/home/minindu/hexapod_ws/install/prowler_control/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/yolo_detector/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/vector_navigation/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/vector_interfaces/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/vector_apriltag/lib/python3.12/site-packages",
+    "/opt/ros/jazzy/lib/python3.12/site-packages"
+  ],
+  "python.analysis.extraPaths": [
+    "/home/minindu/hexapod_ws/install/prowler_description/lib/python3.12/site-packages",
+    "/home/minindu/hexapod_ws/install/prowler_control/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/yolo_detector/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/vector_navigation/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/vector_interfaces/lib/python3.12/site-packages",
+    "/home/minindu/ros2_ws/install/vector_apriltag/lib/python3.12/site-packages",
+    "/opt/ros/jazzy/lib/python3.12/site-packages"
+  ]
+}
