@@ -148,7 +148,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     firebaseTask,   // Function
     "firebaseTask", // Name
-    8192,           // Stack size (HTTPS needs headroom)
+    16384,          // Stack size (batched JSON for 5 students)
     NULL,           // Parameters
     1,              // Priority
     NULL,           // Handle
