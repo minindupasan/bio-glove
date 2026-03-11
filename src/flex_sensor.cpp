@@ -147,23 +147,23 @@ const char* gestureToText(uint8_t g) {
 
 
 static uint8_t gestureIdFromState(HandPos hp, bool T_straight, bool I_straight, bool M_straight, bool R_straight, bool P_straight) {
-  // Common gyro orientation for YES
+  // Common gyro orientation for YES (Thumbs Up)
   bool yes_orientation = (roll > -145.0f && roll < -55.0f && pitch > -45.0f && pitch < 15.0f);
+  // NO gesture is exact positive range of YES gesture
+  bool no_orientation = (roll > 55.0f && roll < 145.0f && pitch > -15.0f && pitch < 45.0f);
 
   // YES: thumb straight + Index/Middle/Ring/Pinky bent + gyro orientation
   if (yes_orientation && T_straight && !I_straight && !M_straight && !R_straight && !P_straight) {
     return G_YES;
   }
 
+  // NO: thumb straight + Index/Middle/Ring/Pinky bent + gyro orientation
+  if (no_orientation && T_straight && !I_straight && !M_straight && !R_straight && !P_straight) {
+    return G_NO;
+  }
+
   // UP + S S S S => question
   if (hp == HAND_UP && T_straight && I_straight && M_straight && R_straight) return G_QUESTION;
-
-  // Thumb straight, others bent
-  if (T_straight && !I_straight && !M_straight && !R_straight) {
-    if (hp == HAND_DOWN) {
-      return G_NO;
-    }
-  }
 
   // Thumb & Index straight, others bent
   if (T_straight && I_straight && !M_straight && !R_straight) {
