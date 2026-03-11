@@ -38,7 +38,7 @@
 //
 //  WIRING:
 //  LDR   leg1 → 3.3V | leg2 → GPIO34 + 1kΩ to GND
-//  DHT22 DATA → GPIO35 + 10kΩ pull-up to 3.3V
+//  DHT22 DATA → GPIO32 + 10kΩ pull-up to 3.3V
 //  IR-TX GPIO19 → 1kΩ → BC547 Base
 //        BC547 Collector → IR LED Cathode
 //        IR LED Anode → 3.3V | BC547 Emitter → GND
@@ -75,7 +75,7 @@ FirebaseAuth   fbAuth;
 
 // ── Hardware Pins ─────────────────────────────────────────────
 #define LDR_PIN        34
-#define DHT_PIN        35
+#define DHT_PIN        32
 #define IR_TX_PIN      19
 #define I2C_SDA        21
 #define I2C_SCL        22
@@ -257,10 +257,13 @@ ZoneResult computeZones() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  LDR AMBIENT SCALING
+//  LDR AMBIENT SCALING (Digital Module)
 // ─────────────────────────────────────────────────────────────
-int applyLDR(int b, int ldr){
-  float f = (ldr<1000)?0.3f:(ldr<2500)?0.65f:1.0f;
+//  Digital LDRs output 1 (HIGH) when dark, and 0 (LOW) when light.
+//  If room is dark: allow full LED brightness (1.0f multiplier).
+//  If room is light: dim LEDs (0.3f multiplier).
+int applyLDR(int b, int ldrDigital){
+  float f = (ldrDigital == 1) ? 1.0f : 0.3f;
   return constrain((int)(b*f), 0, 255);
 }
 
@@ -331,30 +334,27 @@ void updateAC(float tempC, float composite) {
 // ─────────────────────────────────────────────────────────────
 //  PUSH ENVIRONMENT DATA TO FIREBASE (for web dashboard)
 // ─────────────────────────────────────────────────────────────
-//  Writes to environment/{sid}/ so each student's dashboard
-//  and the teacher dashboard can see AC & lighting status.
+//  Writes to /environment/ so the teacher dashboard can see 
+//  AC, lighting status, temp, humidity, and ldr.
 // ─────────────────────────────────────────────────────────────
-void pushEnvironmentToFirebase(int finalBright, float composite,
+void pushEnvironmentToFirebase(int ldr, int finalBright, float composite,
                                float tempC, float humidity) {
   FirebaseJson envJson;
   envJson.set("ac",               acState.powerOn ? "ON" : "OFF");
   envJson.set("ac_setpoint",      acState.setpointC);
   envJson.set("lighting",         String(String((finalBright * 100) / 255) + "%"));
   envJson.set("brightness_pwm",   finalBright);
+  envJson.set("ldr",              ldr);
   envJson.set("composite_stress", roundf(composite * 10) / 10.0f);
   envJson.set("temp",             isnan(tempC) ? 0 : roundf(tempC * 10) / 10.0f);
   envJson.set("humidity",         isnan(humidity) ? 0 : roundf(humidity * 10) / 10.0f);
   envJson.set("timestamp",        (double)millis());
 
-  // Write same environment to all students (shared classroom)
-  for (int i = 0; i < NUM_STUDENTS; i++) {
-    String path = String("/environment/") + STUDENT_NAMES[i];
-    if (!Firebase.setJSON(fbdo, path.c_str(), envJson)) {
-      Serial.printf("  ENV push to %s FAILED: %s\n",
-                    STUDENT_NAMES[i], fbdo.errorReason().c_str());
-    }
+  if (!Firebase.setJSON(fbdo, "/environment", envJson)) {
+    Serial.printf("  ENV push to /environment FAILED: %s\n", fbdo.errorReason().c_str());
+  } else {
+    Serial.println("  ENV → Firebase OK (/environment)");
   }
-  Serial.println("  ENV → Firebase OK (all students)");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -443,6 +443,8 @@ void setup() {
   Serial.println(" LED: I2C → Arduino (5V PWM)");
   Serial.println("==============================================");
 
+  pinMode(LDR_PIN, INPUT);
+
   Serial.print("Wi-Fi connecting");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while(WiFi.status() != WL_CONNECTED){ Serial.print("."); delay(500); }
@@ -494,7 +496,8 @@ void loop() {
   ZoneResult zone = computeZones();
 
   // ── STEP 6 : Read ambient sensors ────────────────────────────
-  int   ldr      = analogRead(LDR_PIN);
+  // Digital LDR: 1 = Dark, 0 = Light
+  int   ldr      = digitalRead(LDR_PIN);
   float humidity = dht.readHumidity();
   float tempC    = dht.readTemperature();
 
@@ -510,7 +513,7 @@ void loop() {
   updateAC(tempC, composite);
 
   // ── STEP 10 : Push environment data to Firebase ───────────────
-  pushEnvironmentToFirebase(ledBright, composite, tempC, humidity);
+  pushEnvironmentToFirebase(ldr, ledBright, composite, tempC, humidity);
 
   // ── STEP 11 : Human-readable summary ─────────────────────────
   Serial.printf(

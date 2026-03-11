@@ -3,6 +3,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { db } from "@/lib/firebase";
 import { ref, onValue, set, serverTimestamp } from "firebase/database";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
+import { Eye, HandMetal, Thermometer, Mic, MicOff, LogOut } from "lucide-react";
 
 export default function TeacherDashboard({ onLogout }) {
   const [selectedStudent, setSelectedStudent] = useState("s01");
@@ -22,7 +28,7 @@ export default function TeacherDashboard({ onLogout }) {
   useEffect(() => {
     const engRef = ref(db, `engagement/${selectedStudent}`);
     const signRef = ref(db, `sign/${selectedStudent}`);
-    const envRef = ref(db, `environment/${selectedStudent}`);
+    const envRef = ref(db, `environment`); // Changed to global environment path
 
     const unsub1 = onValue(engRef, (snap) => {
       setEngagement(snap.val());
@@ -44,8 +50,11 @@ export default function TeacherDashboard({ onLogout }) {
   // Push transcript to Firebase
   const pushTranscript = useCallback(
     (text) => {
-      if (!text.trim()) return;
       const tRef = ref(db, `transcription/${selectedStudent}`);
+      if (!text.trim()) {
+        set(tRef, null);
+        return;
+      }
       set(tRef, {
         text: text.trim(),
         timestamp: Date.now(),
@@ -54,11 +63,18 @@ export default function TeacherDashboard({ onLogout }) {
     [selectedStudent]
   );
 
+  const clearTranscript = useCallback(() => {
+    setTranscript("");
+    transcriptRef.current = "";
+    pushTranscript("");
+  }, [pushTranscript]);
+
   // Speech recognition setup
   const toggleRecording = () => {
     if (isRecording) {
       if (recognitionRef.current) {
         recognitionRef.current.stop();
+        recognitionRef.current = null; // Detach reference to prevent restart
       }
       setIsRecording(false);
       return;
@@ -87,6 +103,13 @@ export default function TeacherDashboard({ onLogout }) {
     };
 
     recognition.onerror = (event) => {
+      // 'network' errors happen frequently in some browsers due to silent timeouts or brief disconnects.
+      // We ignore them here and let the `onend` handler restart the recognition automatically.
+      if (event.error === "network") {
+        console.warn("Speech network connection briefly dropped, attempting to restart...");
+        return;
+      }
+      
       console.error("Speech error:", event.error);
       if (event.error !== "no-speech") {
         setIsRecording(false);
@@ -94,12 +117,17 @@ export default function TeacherDashboard({ onLogout }) {
     };
 
     recognition.onend = () => {
-      // Restart if still recording
-      if (isRecording) {
+      // If the ref still points to this recognition instance, we didn't intentionally stop it.
+      // We should restart it to keep continuous listening active.
+      if (recognitionRef.current === recognition) {
         try {
           recognition.start();
         } catch (e) {
-          console.error("Restart failed:", e);
+          if (e.name !== "InvalidStateError") {
+            console.error("Restart failed, resetting state:", e);
+            recognitionRef.current = null;
+            setIsRecording(false);
+          }
         }
       }
     };
@@ -120,139 +148,163 @@ export default function TeacherDashboard({ onLogout }) {
   const signConf = signData?.confidence ?? 0;
 
   // Environment display
+  const temp = environment?.temp ?? "—";
+  const humidity = environment?.humidity ?? "—";
   const acStatus = environment?.ac ?? "—";
+  const acSetPoint = environment?.ac_setpoint ?? "—";
   const lightStatus = environment?.lighting ?? "—";
 
   return (
-    <div className="dashboard-container">
+    <div className="min-h-screen bg-black p-4 md:p-8 text-zinc-200">
       {/* Header */}
-      <div className="dashboard-header">
-        <div className="header-left">
-          <h2>Smart Classroom</h2>
-          <span className="header-badge badge-teacher">Teacher</span>
+      <header className="flex flex-col md:flex-row items-center justify-between gap-4 p-4 md:p-6 mb-8 rounded-xl bg-zinc-950 border border-zinc-800 shadow-sm">
+        <div className="flex items-center gap-4">
+          <h2 className="text-xl font-bold text-white tracking-tight">
+            Smart Classroom
+          </h2>
+          <Badge variant="outline" className="bg-white/10 text-white border-white/20">
+            Teacher
+          </Badge>
         </div>
-        <div className="header-right">
-          <select
-            className="student-switcher"
-            value={selectedStudent}
-            onChange={(e) => setSelectedStudent(e.target.value)}
-          >
-            <option value="s01">Student 01</option>
-            <option value="s02">Student 02</option>
-            <option value="s03">Student 03</option>
-            <option value="s04">Student 04</option>
-            <option value="s05">Student 05</option>
-          </select>
-          <button className="logout-btn" onClick={onLogout}>
-            ← Logout
-          </button>
+        <div className="flex items-center gap-4 w-full md:w-auto">
+          <Select value={selectedStudent} onValueChange={setSelectedStudent}>
+            <SelectTrigger className="w-[180px] bg-zinc-900 border-zinc-800">
+              <SelectValue placeholder="Select Student" />
+            </SelectTrigger>
+            <SelectContent className="bg-zinc-900 border-zinc-800 text-zinc-200">
+              <SelectItem value="s01">Student 01</SelectItem>
+              <SelectItem value="s02">Student 02</SelectItem>
+              <SelectItem value="s03">Student 03</SelectItem>
+              <SelectItem value="s04">Student 04</SelectItem>
+              <SelectItem value="s05">Student 05</SelectItem>
+            </SelectContent>
+          </Select>
+          <Button variant="ghost" onClick={onLogout} className="text-zinc-400 hover:text-white hover:bg-white/10">
+            <LogOut className="w-4 h-4 mr-2" />
+            Logout
+          </Button>
         </div>
-      </div>
+      </header>
 
       {/* Dashboard Grid */}
-      <div className="teacher-grid">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        
         {/* Engagement Panel */}
-        <div className="glass-card panel">
-          <div className="panel-header">
-            <div className="panel-icon emerald">👁️</div>
-            <span className="panel-title">Engagement</span>
-          </div>
-          <div
-            className={`big-value ${isEngaged ? "engaged" : "not-engaged"}`}
-          >
-            {isEngaged ? "ENGAGED" : "NOT ENGAGED"}
-          </div>
-          <div className="sub-value">
-            <span
-              className={`status-dot ${isEngaged ? "green" : "red"}`}
-            ></span>
-            {engStatus}
-          </div>
-          <div className="score-bar-container">
-            <div
-              className="score-bar"
-              style={{
-                width: `${engScore}%`,
-                background: isEngaged
-                  ? "var(--accent-emerald)"
-                  : "var(--accent-red)",
-              }}
-            />
-          </div>
-          <div className="sub-value" style={{ marginTop: 8 }}>
-            Score: {engScore}%
-          </div>
-        </div>
+        <Card className="bg-zinc-950 border-zinc-800">
+          <CardHeader className="flex flex-row items-center pb-2">
+            <div className="p-2 mr-3 rounded-lg bg-emerald-500/10 text-emerald-400">
+              <Eye className="w-5 h-5" />
+            </div>
+            <CardTitle className="text-base font-semibold text-zinc-300 uppercase tracking-wider">Engagement</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className={`text-4xl font-extrabold mb-2 ${isEngaged ? "text-emerald-400" : "text-red-400"}`}>
+              {isEngaged ? "ENGAGED" : "NOT ENGAGED"}
+            </div>
+            <div className="flex items-center gap-2 mb-6 text-sm text-zinc-400">
+              <div className={`w-2 h-2 rounded-full ${isEngaged ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "bg-red-400 shadow-[0_0_8px_rgba(248,113,113,0.8)]"}`}></div>
+              {engStatus}
+            </div>
+            
+            <Progress value={engScore} className={`h-2 ${isEngaged ? "bg-emerald-950" : "bg-red-950"}`} indicatorClassName={isEngaged ? "bg-emerald-500" : "bg-red-500"} />
+            <div className="mt-2 text-sm text-zinc-500 font-medium">Score: {engScore}%</div>
+          </CardContent>
+        </Card>
 
         {/* Sign Language Panel */}
-        <div className="glass-card panel">
-          <div className="panel-header">
-            <div className="panel-icon cyan">🤟</div>
-            <span className="panel-title">Sign Language</span>
-          </div>
-          <div className="big-value sign">
-            {signData ? signLabel.toUpperCase() : (
-              <span className="shimmer">Waiting...</span>
-            )}
-          </div>
-          {signData && (
-            <div className="confidence-bar">
-              <div className="confidence-track">
-                <div
-                  className="confidence-fill"
-                  style={{ width: `${(signConf * 100).toFixed(0)}%` }}
-                />
-              </div>
-              <span className="confidence-text">
-                {(signConf * 100).toFixed(0)}%
-              </span>
+        <Card className="bg-zinc-950 border-zinc-800">
+          <CardHeader className="flex flex-row items-center pb-2">
+            <div className="p-2 mr-3 rounded-lg bg-cyan-500/10 text-cyan-400">
+              <HandMetal className="w-5 h-5" />
             </div>
-          )}
-          <div className="sub-value" style={{ marginTop: 8 }}>
-            Detected sign from student camera
-          </div>
-        </div>
+            <CardTitle className="text-base font-semibold text-zinc-300 uppercase tracking-wider">Sign Language</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-4xl font-extrabold text-cyan-400 mb-6">
+              {signData ? signLabel.toUpperCase() : (
+                <span className="text-zinc-600 animate-pulse">Waiting...</span>
+              )}
+            </div>
+            
+            {signData ? (
+              <div className="flex items-center gap-3">
+                <Progress value={signConf * 100} className="h-1.5 bg-zinc-800 flex-1" indicatorClassName="bg-cyan-500" />
+                <span className="text-xs text-zinc-500 w-10 text-right">{(signConf * 100).toFixed(0)}%</span>
+              </div>
+            ) : (
+                <div className="h-1.5 w-full bg-zinc-800 rounded-full mt-7"></div>
+            )}
+            <div className="mt-3 text-sm text-zinc-500">Detected sign from student camera</div>
+          </CardContent>
+        </Card>
 
         {/* Environment Panel */}
-        <div className="glass-card panel">
-          <div className="panel-header">
-            <div className="panel-icon amber">🌡️</div>
-            <span className="panel-title">Environment</span>
-          </div>
-          <div className="env-row">
-            <span className="env-label">
-              ❄️ Air Conditioning
-            </span>
-            <span className="env-value">{acStatus}</span>
-          </div>
-          <div className="env-row">
-            <span className="env-label">
-              💡 Lighting
-            </span>
-            <span className="env-value">{lightStatus}</span>
-          </div>
-        </div>
+        <Card className="bg-zinc-950 border-zinc-800">
+          <CardHeader className="flex flex-row items-center pb-2">
+            <div className="p-2 mr-3 rounded-lg bg-amber-500/10 text-amber-500">
+              <Thermometer className="w-5 h-5" />
+            </div>
+            <CardTitle className="text-base font-semibold text-zinc-300 uppercase tracking-wider">Environment</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4 mt-2">
+            <div className="flex justify-between items-center pb-3 border-b border-zinc-800/60">
+              <span className="text-zinc-400 text-sm flex items-center gap-2">Temperature / Humidity</span>
+              <span className="font-semibold">{temp !== "—" ? <span className="text-amber-400">{temp}°C</span> : "—"} / {humidity !== "—" ? <span className="text-blue-400">{humidity}%</span> : "—"}</span>
+            </div>
+            <div className="flex justify-between items-center pb-3 border-b border-zinc-800/60">
+              <span className="text-zinc-400 text-sm flex items-center gap-2">AC Status (Set: {acSetPoint !== "—" ? `${acSetPoint}°C` : "—"})</span>
+              <Badge variant={acStatus === "ON" ? "default" : "secondary"} className={acStatus === "ON" ? "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30" : "bg-zinc-800 text-zinc-400"}>
+                {acStatus}
+              </Badge>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-zinc-400 text-sm flex items-center gap-2">Lighting</span>
+              <span className="font-semibold">{lightStatus}</span>
+            </div>
+          </CardContent>
+        </Card>
 
-        {/* Whisper / Transcription Panel */}
-        <div className="glass-card panel">
-          <div className="panel-header">
-            <div className="panel-icon indigo">🎙️</div>
-            <span className="panel-title">Speech to Student</span>
-          </div>
-          <div className="transcript-area">
-            {transcript || (
-              <span className="shimmer">
-                Click the button below to start speaking...
-              </span>
+        {/* Transcription Panel */}
+        <Card className="bg-zinc-950 border-zinc-800 flex flex-col">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <div className="flex items-center">
+              <div className="p-2 mr-3 rounded-lg bg-indigo-500/10 text-indigo-400">
+                <Mic className="w-5 h-5" />
+              </div>
+              <CardTitle className="text-base font-semibold text-zinc-300 uppercase tracking-wider">Speech to Student</CardTitle>
+            </div>
+            {transcript && (
+              <Button variant="ghost" size="sm" onClick={clearTranscript} className="text-zinc-500 hover:text-red-400 h-8 px-2 text-xs">
+                Clear
+              </Button>
             )}
-          </div>
-          <button
-            className={`mic-btn ${isRecording ? "recording" : ""}`}
-            onClick={toggleRecording}
-          >
-            {isRecording ? "🔴 Stop Recording" : "🎤 Start Speaking"}
-          </button>
-        </div>
+          </CardHeader>
+          <CardContent className="flex flex-col flex-1 h-full pt-2">
+            <div className="bg-black border border-zinc-800 rounded-lg p-4 min-h-[120px] max-h-[160px] overflow-y-auto w-full mb-4 text-zinc-300 text-sm leading-relaxed">
+              {transcript || (
+                <span className="text-zinc-600 animate-pulse">
+                  Click the button below to start speaking...
+                </span>
+              )}
+            </div>
+            
+            <Button
+              className={`w-full h-12 mt-auto text-sm font-medium transition-all ${
+                isRecording 
+                  ? "bg-red-500/10 text-red-500 border border-red-500/50 hover:bg-red-500/20 shadow-[0_0_15px_rgba(239,68,68,0.2)] animate-pulse" 
+                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-white border border-zinc-700"
+              }`}
+              onClick={toggleRecording}
+            >
+              {isRecording ? (
+                <><MicOff className="w-4 h-4 mr-2" /> Stop Recording</>
+              ) : (
+                <><Mic className="w-4 h-4 mr-2" /> Start Speaking</>
+              )}
+            </Button>
+          </CardContent>
+        </Card>
+
       </div>
     </div>
   );
