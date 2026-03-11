@@ -22,7 +22,7 @@
 #include <Wire.h>
 
 #define I2C_SLAVE_ADDR  0x08   // Must match ESP32's target address
-#define PWM_PIN         9      // Timer1 PWM pin (490 Hz)
+#define PWM_PIN         3      // Timer1 PWM pin (490 Hz)
 
 volatile uint8_t pwmValue = 0; // Updated by I2C interrupt
 
