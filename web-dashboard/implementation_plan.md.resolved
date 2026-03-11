@@ -1,0 +1,115 @@
+# Smart Classroom Web Dashboard
+
+A real-time web dashboard for the Bio-Glove smart classroom system. Two user roles — **Teacher** and **Student** — each with distinct views. The dashboard reads from Firebase Realtime Database and uses the browser's Web Speech API (or Whisper API) for speech-to-text transcription.
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Whisper Integration**: The user mentioned "what teacher speaks must be sent to student transcribed with whisper." Since Whisper typically runs server-side (python), I'll use the **browser's built-in Web Speech API** (`webkitSpeechRecognition`) for real-time speech-to-text on the teacher's browser, then push the transcript to Firebase so the student can see it. This avoids needing a backend server. If you specifically need OpenAI Whisper instead, let me know and we'll add a Python backend.
+
+> [!IMPORTANT]
+> **Sign Language Data**: You mentioned signs will be stored at `sign/s01/`. The current [unified_monitor.py](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py) doesn't push sign predictions to Firebase yet. I'll build the dashboard to **listen on `sign/{studentId}/`** — you'll need to add a Firebase push in [unified_monitor.py](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py) (a one-liner: `db.reference(f"sign/{STUDENT_ID}").set({"label": sign_label, "confidence": sign_confidence})`) to make it work end-to-end. I can add that too if you'd like.
+
+> [!IMPORTANT]
+> **Environment Data**: You said `environment/s01/ac:` and `environment/s01/lighting:` — the dashboard will listen on this path. You'll manually add this data to Firebase later.
+
+> [!IMPORTANT]
+> **Student Camera View**: The student needs to see their own camera feed. This will be done entirely in-browser using `getUserMedia()` — no data is sent anywhere, it's just a local mirror view with no ML annotations.
+
+## Proposed Changes
+
+### Web Dashboard (Vite + Vanilla JS)
+
+All files will be created inside `/home/minindu/Documents/bio-glove/web-dashboard/`.
+
+---
+
+#### [NEW] `web-dashboard/` — Vite project
+
+Initialize with `npx -y create-vite@latest ./ --template vanilla`.
+
+---
+
+#### [NEW] [index.html](file:///home/minindu/Documents/bio-glove/web-dashboard/index.html)
+
+Entry point. Contains the login/role selection screen and both dashboard views (toggled by JS). Single-page app approach — no router needed.
+
+---
+
+#### [NEW] [style.css](file:///home/minindu/Documents/bio-glove/web-dashboard/style.css)
+
+Complete design system:
+- Dark mode with deep navy/charcoal palette
+- Glassmorphism cards for data panels
+- Vibrant accent colors (emerald green for engaged, red for alerts)
+- Inter font from Google Fonts
+- Smooth transitions and micro-animations
+- Responsive grid layout
+
+---
+
+#### [NEW] [main.js](file:///home/minindu/Documents/bio-glove/web-dashboard/main.js)
+
+Application logic:
+- **Role selection**: Login screen with Teacher/Student toggle and student ID selector
+- **Firebase initialization**: Connect to `smart-classroom-981e2-default-rtdb`
+- **Teacher Dashboard**:
+  - Student selector dropdown (s01–s05)
+  - Real-time listener on `engagement/{sid}` → engagement status
+  - Real-time listener on `sign/{sid}` → detected sign display
+  - Real-time listener on `environment/{sid}` → AC & lighting
+  - Web Speech API for mic capture → transcription pushed to `transcription/{sid}`
+- **Student Dashboard**:
+  - Local camera feed via `getUserMedia()`
+  - Real-time listener on `transcription/{sid}` → shows what teacher said
+  - Sign detection status indicator (reads `sign/{sid}`)
+
+---
+
+#### [NEW] [firebase-config.js](file:///home/minindu/Documents/bio-glove/web-dashboard/firebase-config.js)
+
+Firebase Web SDK configuration:
+```js
+const firebaseConfig = {
+  databaseURL: "https://smart-classroom-981e2-default-rtdb.asia-southeast1.firebasedatabase.app"
+};
+```
+Uses Firebase Realtime Database CDN (compat v9 modular SDK).
+
+---
+
+### ML Script Update (Optional)
+
+#### [MODIFY] [unified_monitor.py](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py)
+
+Add one Firebase push for sign detection results to `sign/{STUDENT_ID}/`:
+```python
+sign_ref = db.reference(f"sign/{STUDENT_ID}")
+# Inside run_sign_inference, after updating sign_label:
+sign_ref.set({"label": sign_label, "confidence": float(sign_confidence)})
+```
+
+## Firebase Database Structure
+
+| Path | Data | Producer | Consumer |
+|------|------|----------|----------|
+| `engagement/{sid}/` | `engagement_score`, `engagement_status` | [unified_monitor.py](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py) | Teacher dashboard |
+| `sign/{sid}/` | `label`, `confidence` | [unified_monitor.py](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py) (to be added) | Teacher dashboard |
+| `environment/{sid}/` | [ac](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py#498-527), `lighting` | Manual / IoT (later) | Teacher dashboard |
+| `transcription/{sid}/` | [text](file:///home/minindu/Documents/bio-glove/ml/advanced_engagement.py#137-141), `timestamp` | Teacher dashboard (Web Speech API) | Student dashboard |
+| `emotion/{sid}/` | `stress_score`, `emotion_label` | [unified_monitor.py](file:///home/minindu/Documents/bio-glove/ml/unified_monitor.py) | Teacher dashboard |
+
+## Verification Plan
+
+### Browser Testing
+1. Run `npm run dev` in `web-dashboard/`
+2. Open the browser to the dev server URL
+3. Verify login screen renders with role selection
+4. Select **Teacher** role → verify teacher dashboard loads with student selector
+5. Select **Student** role → verify student dashboard loads with camera feed  
+6. Check that Firebase listeners are active (engagement, sign, environment panels update when data is present in Firebase)
+
+### Manual Verification
+- **Teacher mic transcription**: Click "Start Speaking" → speak → verify text appears and is pushed to Firebase `transcription/{sid}/`
+- **Student transcript display**: Open student dashboard in a second tab → verify teacher's transcription appears in real-time
+- **Environment data**: Manually write `{ac: "ON", lighting: "Bright"}` to `environment/s01/` in Firebase console → verify it appears on teacher dashboard

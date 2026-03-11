@@ -71,6 +71,7 @@ emotion_ref = db.reference(f"emotion/{STUDENT_ID}")
 eng_ref     = db.reference(f"engagement/{STUDENT_ID}")
 pred_ref    = db.reference("predictions")
 stress_ref  = db.reference("stress")
+sign_ref    = db.reference(f"sign/{STUDENT_ID}")
 print("Connected to Firebase Realtime Database.")
 
 # ---------------------------------------------------------
@@ -331,6 +332,14 @@ def run_sign_inference(buffer_snapshot):
             sign_confidence = sims[top_idx[0]]
             sign_top3       = top3
         print(f"Sign → {sign_labels[top_idx[0]]} ({sims[top_idx[0]]:.2f})")
+        # Push sign detection to Firebase for web dashboard
+        try:
+            sign_ref.set({
+                "label": str(sign_labels[top_idx[0]]),
+                "confidence": float(sims[top_idx[0]]),
+            })
+        except Exception as e:
+            print(f"Sign Firebase error: {e}")
     except Exception as e:
         print(f"Sign inference error: {e}")
     finally:
