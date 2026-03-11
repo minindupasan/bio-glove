@@ -31,6 +31,7 @@ boolean espReady = false;
 String  statusMsg = "Waiting for ESP32-S3...";
 int     totalPackets = 0;
 String  sysGesture = "-";
+String  gestDbg = "";   // YES gesture debug: "orient,T_str,I_bent,M_bent,R_bent,roll,pitch"
 
 int     studentId = 1;
 
@@ -262,6 +263,15 @@ void serialEvent(Serial p) {
       sysGesture = line.substring(8).trim();
       return;
     }
+    if (line.startsWith("GESTDBG:")) {
+      gestDbg = line.substring(8).trim();
+      return;
+    }
+    if (line.startsWith("CALACK:")) {
+      println("ESP32 confirmed: calibration applied");
+      statusMsg = "● LIVE — Calibration synced to ESP32";
+      return;
+    }
   } catch (Exception e) {
     // Silently drop corrupt serial payload packets to keep dashboard alive
     // Console output for debugging: println("Parse Error: " + line);
@@ -298,6 +308,20 @@ void checkFlexCapture() {
   }
   capType = -1; capCount = 0;
   for (int i = 0; i < 5; i++) capSum[i] = 0;
+
+  // Send calibration to ESP32 so gesture detection uses the same thresholds
+  sendCalToESP();
+}
+
+void sendCalToESP() {
+  if (!portOpen || !espReady) return;
+  // Format: SETCAL:rest0,rest1,rest2,rest3,rest4,bend0,bend1,bend2,bend3,bend4
+  // Firmware index order: Ring(0), Thumb(1), Middle(2), Pinky(3), Index(4)
+  String cmd = "SETCAL:"
+    + fxRest[0] + "," + fxRest[1] + "," + fxRest[2] + "," + fxRest[3] + "," + fxRest[4] + ","
+    + fxBend[0] + "," + fxBend[1] + "," + fxBend[2] + "," + fxBend[3] + "," + fxBend[4] + "\n";
+  port.write(cmd);
+  println("Sent to ESP32: " + cmd.trim());
 }
 
 void smoothFlex() {
@@ -334,11 +358,22 @@ void drawHeader() {
   fill(THDIM); textSize(10);
   text("FLEX × 5  |  MPU6050  |  GSR  |  MAX30102  |  CJMCU-30205", 16, HDR_H/2+10);
 
-  // GESTURE READOUT
+  // GESTURE READOUT + YES debug overlay
   fill(BORDER); noStroke(); rect(320, 10, 300, 32, 5);
   if (!sysGesture.equals("-")) {
     fill(color(0, 220, 140)); textFont(fMed); textSize(16); textAlign(CENTER, CENTER);
     text(sysGesture.toUpperCase(), 320 + 300/2, HDR_H/2);
+  } else if (gestDbg.length() > 0) {
+    // Show which YES conditions pass/fail: orient,T_str,I_bent,M_bent,R_bent,roll,pitch
+    String[] d = split(gestDbg, ',');
+    if (d.length >= 7) {
+      boolean orient = d[0].equals("1"), Ts = d[1].equals("1");
+      boolean Ib = d[2].equals("1"), Mb = d[3].equals("1"), Rb = d[4].equals("1");
+      String dbgTxt = (orient?"O":"o") + " " + (Ts?"T":"t") + " " + (Ib?"I":"i") + " " + (Mb?"M":"m") + " " + (Rb?"R":"r")
+        + "  R:" + d[5] + " P:" + d[6];
+      fill(color(255, 200, 50)); textFont(fTiny); textSize(10); textAlign(CENTER, CENTER);
+      text("YES? " + dbgTxt, 320 + 300/2, HDR_H/2);
+    }
   } else {
     fill(THDIM); textFont(fSm); textSize(12); textAlign(CENTER, CENTER);
     text("NO GESTURE", 320 + 300/2, HDR_H/2);

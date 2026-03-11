@@ -160,8 +160,33 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════
 //  LOOP
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+//  SERIAL INPUT BUFFER (commands from Processing dashboard)
+// ═══════════════════════════════════════════════════════════════
+static char rxBuf[128];
+static int  rxLen = 0;
+
+static void processSerialInput() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (rxLen > 0) {
+        rxBuf[rxLen] = '\0';
+        if (strncmp(rxBuf, "SETCAL:", 7) == 0) {
+          applyDashboardCal(rxBuf + 7);
+        }
+        rxLen = 0;
+      }
+    } else if (rxLen < (int)sizeof(rxBuf) - 1) {
+      rxBuf[rxLen++] = c;
+    }
+  }
+}
+
 void loop() {
   unsigned long now = millis();
+
+  processSerialInput();
 
   // ── FLEX @ 20 Hz ──────────────────────────────────────────
   if (now - tFlex >= 50) {
@@ -267,6 +292,7 @@ void loop() {
     // New format for Processing parser
     Serial.print("GESTURE:");
     Serial.println(gestureTxt);
+
 
     // RESTORE DASHBOARD DATA STREAMS:
     // TEMP:34.188,93.537,COOL_SKIN

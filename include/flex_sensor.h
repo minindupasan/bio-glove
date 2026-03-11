@@ -50,6 +50,12 @@ extern uint8_t flexChangeCount[5];
 extern uint8_t g_stableGesture;
 extern volatile int g_gsrRaw;
 
+extern int  FLEX_TH_FINGER[5];
+extern int  flexMidpoint[5];
+extern int  flexBendDir[5];
+extern bool flexHasDashCal;
+
 void calibrateFlexSensors();
+void applyDashboardCal(const char* payload);
 void flexTask(void *pv);
 const char* gestureToText(uint8_t g);

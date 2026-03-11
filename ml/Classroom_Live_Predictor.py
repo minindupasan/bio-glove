@@ -132,7 +132,7 @@ except ValueError:
     cred = credentials.Certificate(FIREBASE_CRED_PATH)
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
-root_ref = db.reference("smartglove")
+root_ref = db.reference("/")
 pred_ref = db.reference("predictions")
 print("Connected to Firebase Realtime Database.")
 
