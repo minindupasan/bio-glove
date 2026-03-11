@@ -234,7 +234,9 @@ void loop() {
     const char* handStr = (hp == HAND_UP) ? "UP" : (hp == HAND_DOWN) ? "DOWN" : "REST";
     const char* gestureTxt = gestureToText(stableGestureLocal);
 
-    Serial.print("HAND=");
+    Serial.print("WIFI=");
+    Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "NO");
+    Serial.print("  HAND=");
     Serial.print(handStr);
 
     // Our array map: Ring=0, Thumb=1, Middle=2, Pinky=3, Index=4
