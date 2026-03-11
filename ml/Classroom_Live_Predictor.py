@@ -227,11 +227,11 @@ while True:
         sensor_score = float(clf.predict_proba(vec)[0][1])
 
         # Camera emotion fusion (70/30)
-        emotion_data  = root_ref.child(f"{sid}/camera_emotion").get()
+        emotion_data  = db.reference(f"emotion/{sid}").get()
         emotion_score = 0.5
         if emotion_data and isinstance(emotion_data, dict):
             if "timestamp" in emotion_data and (int(time.time() * 1000) - emotion_data["timestamp"] < 30000):
-                emotion_score = float(emotion_data.get("emotion_score", 0.5))
+                emotion_score = float(emotion_data.get("stress_score", 0.5))
 
         stress_score = (sensor_score * 0.7) + (emotion_score * 0.3)
         stress_level = round(stress_score * 100, 1)

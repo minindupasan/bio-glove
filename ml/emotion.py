@@ -12,7 +12,7 @@ from firebase_admin import credentials, db
 # ---------------------------------------------------------
 FIREBASE_CRED_PATH = "serviceAccountKey.json"
 FIREBASE_DB_URL    = "https://smart-classroom-981e2-default-rtdb.asia-southeast1.firebasedatabase.app"
-STUDENT_ID         = "S05"  # Ensure this matches the live Predictor Target
+STUDENT_ID         = "s01"  # Ensure this matches the live Predictor Target
 
 print("Connecting to Firebase Desktop Application...")
 try:
@@ -22,6 +22,7 @@ except ValueError:
     firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
 root_ref = db.reference("smartglove")
+emotion_ref = db.reference(f"emotion/{STUDENT_ID}")
 
 # 1. Camera Initialization
 cap = cv2.VideoCapture(0) # 0 for Webcam
@@ -29,6 +30,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 current_emotion = "Analyze.."
+last_pushed_emotion = None
 stress_status = "Checking..."
 color = (255, 255, 255)
 emotion_score = 0.0
@@ -41,11 +43,18 @@ def push_emotion_to_firebase(emotion_label, em_score):
             "emotion_score": em_score,
             "timestamp": int(time.time() * 1000)
         })
+        emotion_ref.set({
+            "stress_score": em_score,
+            "emotion_label": emotion_label,
+            "timestamp": int(time.time() * 1000)
+        })
     except Exception as e:
+        import traceback
         print(f"Firebase Update Error: {e}")
+        traceback.print_exc()
 
 def analyze_face(frame):
-    global current_emotion, stress_status, color, emotion_score
+    global current_emotion, last_pushed_emotion, stress_status, color, emotion_score
     
     try:
         # DeepFace Emotion Extraction
@@ -71,7 +80,10 @@ def analyze_face(frame):
             color = (0, 255, 255) # Yellow
             emotion_score = 0.5
             
-        push_emotion_to_firebase(current_emotion, emotion_score)
+        if dominant_emotion != last_pushed_emotion:
+            push_emotion_to_firebase(current_emotion, emotion_score)
+            last_pushed_emotion = dominant_emotion
+            print(f"Emotion changed → {dominant_emotion} (score: {emotion_score})")
 
     except Exception as e:
         print("Analysis Error:", e)
