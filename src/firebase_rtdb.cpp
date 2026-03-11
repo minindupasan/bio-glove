@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
-//  FIREBASE RTDB — sends real s01 + simulated s02-s05 data
-//  Endpoint: PATCH /.json  (single batched request for all 5)
+//  FIREBASE RTDB — appends real s01 + simulated s02-s05 data
+//  under timestamped keys via multi-path PATCH
+//  Path: smartglove/{sid}/{YYYYMMDD_HHMMSS_mmm}/raw/, processed/
 // ═══════════════════════════════════════════════════════════════
 
 #include <Arduino.h>
@@ -9,6 +10,7 @@
 #include <HTTPClient.h>
 #include <esp_wifi.h>
 #include <esp_random.h>
+#include <time.h>
 
 #include "firebase_config.h"
 #include "firebase_rtdb.h"
@@ -19,6 +21,45 @@
 
 extern float              g_tempC;
 extern SemaphoreHandle_t  i2cMutex;
+
+// ═══════════════════════════════════════════════════════════════
+//  NTP — generates YYYYMMDD_HHMMSS_mmm timestamp keys
+// ═══════════════════════════════════════════════════════════════
+static bool ntpSynced = false;
+
+static void syncNTP() {
+  configTzTime("UTC-5:30", "pool.ntp.org", "time.google.com");
+  Serial.println("INFO:Waiting for NTP sync...");
+  struct tm t;
+  int tries = 0;
+  while (!getLocalTime(&t) && tries < 20) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    tries++;
+  }
+  if (getLocalTime(&t)) {
+    ntpSynced = true;
+    Serial.printf("INFO:NTP synced: %04d-%02d-%02d %02d:%02d:%02d\n",
+                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                  t.tm_hour, t.tm_min, t.tm_sec);
+  } else {
+    Serial.println("WARN:NTP sync failed — using millis fallback");
+  }
+}
+
+static void buildTimestampKey(char *buf, size_t len) {
+  if (ntpSynced) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm t;
+    localtime_r(&tv.tv_sec, &t);
+    int ms = tv.tv_usec / 1000;
+    snprintf(buf, len, "%04d%02d%02d_%02d%02d%02d_%03d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec, ms);
+  } else {
+    snprintf(buf, len, "%lu", (unsigned long)millis());
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 //  Simulation — per-student fixed offsets + random noise
@@ -94,6 +135,7 @@ void firebaseTask(void *pv) {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("INFO:WiFi connected, IP=");
     Serial.println(WiFi.localIP());
+    syncNTP();
   } else {
     Serial.println("WARN:WiFi failed — will keep retrying");
   }
@@ -103,6 +145,7 @@ void firebaseTask(void *pv) {
 
   // ── Static JSON buffer (avoids heap/PSRAM issues) ──────────
   static char json[5120];
+  static char tsKey[32];
   const size_t JSON_CAP = sizeof(json);
   Serial.printf("INFO:JSON buffer %u bytes (static)\n", (unsigned)JSON_CAP);
 
@@ -112,6 +155,8 @@ void firebaseTask(void *pv) {
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
+
+    if (!ntpSynced) syncNTP();
 
     // ── Snapshot all sensor globals ──────────────────────────
     int  fRaw[5], fKal[5];
@@ -146,12 +191,15 @@ void firebaseTask(void *pv) {
                            : (hp == HAND_DOWN) ? "DOWN" : "REST";
     const char* gestureTxt = gestureToText(gestureLocal);
 
+    // ── Build timestamp key (shared across all students) ──────
+    buildTimestampKey(tsKey, sizeof(tsKey));
+
     // ── Build batched JSON for all 5 students ────────────────
     int pos = 0;
 
     // ── s01: real data (with flex) ───────────────────────────
     pos += snprintf(json + pos, JSON_CAP - pos,
-      "{\"s01\":{"
+      "{\"s01/%s\":{"
         "\"raw\":{"
           "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
           "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
@@ -171,6 +219,7 @@ void firebaseTask(void *pv) {
         "\"device_uptime_ms\":%lu,"
         "\"timestamp\":{\".sv\":\"timestamp\"}"
       "}",
+      tsKey,
       aX, aY, aZ,
       gX, gY, gZ,
       ir, (unsigned long)red,
@@ -215,7 +264,7 @@ void firebaseTask(void *pv) {
       float sVgsr   = sGsr * (3.3f / 4095.0f);
 
       pos += snprintf(json + pos, JSON_CAP - pos,
-        ",\"%s\":{"
+        ",\"%s/%s\":{"
           "\"raw\":{"
             "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
             "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
@@ -233,7 +282,7 @@ void firebaseTask(void *pv) {
           "\"device_uptime_ms\":%lu,"
           "\"timestamp\":{\".sv\":\"timestamp\"}"
         "}",
-        simIds[s],
+        simIds[s], tsKey,
         sAx, sAy, sAz,
         sGx, sGy, sGz,
         sIr, sRed,
@@ -253,7 +302,7 @@ void firebaseTask(void *pv) {
 
     Serial.printf("INFO:JSON size=%d bytes\n", pos);
 
-    // ── PATCH to /.json (all 5 students in one request) ──────
+    // ── PATCH to /.json (all 5 under timestamps) ─────────────
     HTTPClient http;
     String url = String(FIREBASE_DB_URL) + "/.json";
     http.begin(sslClient, url);

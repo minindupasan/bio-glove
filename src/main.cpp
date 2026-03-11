@@ -35,7 +35,7 @@
 #include <Wire.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
-
+#include "WiFi.h"
 #include "kalman.h"
 #include "flex_sensor.h"
 #include "mpu6050.h"
