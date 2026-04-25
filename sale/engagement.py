@@ -1,40 +1,32 @@
 """
 SALE Component 3 — Engagement Module
 ======================================
-Computes E (engagement score) from MediaPipe Face Mesh landmarks.
+Computes E (engagement score ∈ [0,1]) and engagement_mode from Face Mesh.
 
-Deaf-classroom calibrations applied:
-  - Interpreter zone gaze is NOT penalised
-    (deaf students naturally alternate between teacher and interpreter)
-  - Downward pitch (reading/board-looking) is NOT penalised
-  - Sign-following gaze is NOT penalised during active signing
-  - EAR threshold tuned for alert-but-focused face shape
+Three engagement states:
+  ENGAGED   — looking at screen/camera directly. Score 0.80–1.00.
+  ATTENTIVE — looking at teacher (above camera) or book (below). Score 0.55–0.80.
+              These are legitimate classroom behaviours, not distractions.
+  DISENGAGED — looking sideways, eyes closed, or face absent. Score 0.00–0.55.
 
-Engagement score E ∈ [0.0, 1.0]:
-  1.0 = fully engaged (eyes open, face forward or toward interpreter)
-  0.0 = disengaged (closed eyes, face away, or completely turned)
+Pitch zones (pitch > 0 = down, pitch < 0 = up):
+  Camera zone    : -10° to +10°  → ENGAGED   (score 1.0)
+  Teacher zone   : -10° to -55°  → ATTENTIVE (score ~0.72, Gaussian)
+  Book zone      : +10° to +50°  → ATTENTIVE (score ~0.72, Gaussian)
+  Extreme up/down: beyond ±55°   → DISENGAGED (Gaussian decay)
 
-Usage:
-    from engagement import EngagementEstimator
-
-    estimator = EngagementEstimator(cam_w=1280, cam_h=720)
-
-    # In your MediaPipe frame loop:
-    if mp_results.multi_face_landmarks:
-        lm = mp_results.multi_face_landmarks[0].landmark
-        E  = estimator.update(lm)
-    else:
-        E  = estimator.last_score   # hold last known value
+Deaf-classroom calibrations:
+  - Interpreter zone (±30° yaw) is not penalised
+  - Active signing: lateral gaze is not penalised
+  - Score decays exponentially toward 0 when no face detected
 """
 
-import collections
 import cv2
 import numpy as np
 
 from config import SMOOTHING_WIN
 
-
-# ── MediaPipe landmark indices ────────────────────────────────────────────────
+# ── MediaPipe landmark indices ─────────────────────────────────────────────────
 _L_EAR_IDX = [362, 385, 387, 263, 373, 380]
 _R_EAR_IDX = [33,  160, 158, 133, 153, 144]
 _L_IRIS    = [474, 475, 476, 477]
@@ -53,34 +45,53 @@ _POSE_3D   = np.array([
     [150., -150., -125.]
 ], dtype=np.float64)
 
-# Engagement score thresholds
-_EAR_BLINK_THRESH  = 0.18   # below this → likely blinking
-_EAR_DROWSY_THRESH = 0.22   # below this → reduced alertness
-_GAZE_THRESH       = 0.40   # gaze offset ratio — above + head turned = looking away
-_YAW_INTERPRETER   = 40.0   # degrees — within this range looking at interpreter is OK
-_YAW_FAR           = 70.0   # degrees — beyond this is clearly disengaged
-_PITCH_DOWN_OK     = 30.0   # degrees downward — reading/notes, acceptable
-_BLINK_CONFIRM     = 3      # consecutive low-EAR frames to confirm blink
+# ── EAR thresholds ─────────────────────────────────────────────────────────────
+_EAR_OPEN   = 0.25    # fully open
+_EAR_CLOSED = 0.17    # closed / blinking
+
+# ── Yaw thresholds ─────────────────────────────────────────────────────────────
+_YAW_INTERP = 30.0    # interpreter zone — no penalty within ±30°
+_YAW_SIGMA  = 25.0    # Gaussian decay beyond interpreter zone
+
+# ── Pitch zones ────────────────────────────────────────────────────────────────
+# pitch > 0 → looking down, pitch < 0 → looking up
+_PITCH_CAMERA_HALF  = 10.0   # ±10° = looking at camera → ENGAGED
+_PITCH_TEACHER_MAX  = 55.0   # looking up past 55° → no longer "at teacher"
+_PITCH_BOOK_MAX     = 50.0   # looking down past 50° → no longer "at book"
+_PITCH_ATTENTIVE_SCORE = 0.72  # score assigned inside teacher/book zones
+_PITCH_DECAY_SIGMA  = 20.0   # Gaussian decay beyond attentive zones
+
+# ── Gaze thresholds ────────────────────────────────────────────────────────────
+_GAZE_CENTER = 0.15
+_GAZE_SIGMA  = 0.18
+
+# ── Component weights (must sum to 1.0) ────────────────────────────────────────
+_W_EAR   = 0.28
+_W_YAW   = 0.38
+_W_PITCH = 0.24
+_W_GAZE  = 0.10
+
+# ── Smoothing ──────────────────────────────────────────────────────────────────
+_EMA_ALPHA     = 0.18   # exponential smoothing (lower = smoother)
+_NO_FACE_DECAY = 0.82   # multiply per frame when no face (~0.1 after 10 frames)
+
+# ── State thresholds ──────────────────────────────────────────────────────────
+_SCORE_ENGAGED    = 0.75   # E ≥ this → ENGAGED
+_SCORE_ATTENTIVE  = 0.45   # E ≥ this → ATTENTIVE
+                            # E <  this → DISENGAGED
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LOW-LEVEL LANDMARK HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Low-level helpers ──────────────────────────────────────────────────────────
 
-def _ear(lm, idx: list, w: int, h: int) -> float:
-    """Eye Aspect Ratio — lower = more closed."""
+def _ear(lm, idx, w, h):
     pts = np.array([[lm[i].x * w, lm[i].y * h] for i in idx])
     A   = np.linalg.norm(pts[1] - pts[5])
     B   = np.linalg.norm(pts[2] - pts[4])
     C   = np.linalg.norm(pts[0] - pts[3]) + 1e-6
-    return float((A + B) / (2 * C))
+    return float((A + B) / (2.0 * C))
 
 
-def _gaze_offset(lm, iris_idx: list, eye_idx: list, w: int, h: int) -> float:
-    """
-    Gaze offset ratio — how far the iris centre is from the eye centre.
-    0.0 = looking straight ahead; higher = looking sideways.
-    """
+def _gaze_offset(lm, iris_idx, eye_idx, w, h):
     iris_pts = np.array([[lm[i].x * w, lm[i].y * h] for i in iris_idx])
     eye_pts  = np.array([[lm[i].x * w, lm[i].y * h] for i in eye_idx[:8]])
     iris_c   = iris_pts.mean(0)
@@ -89,23 +100,14 @@ def _gaze_offset(lm, iris_idx: list, eye_idx: list, w: int, h: int) -> float:
     return float(np.linalg.norm(iris_c - eye_c) / eye_w)
 
 
-def _head_pose(lm, w: int, h: int) -> tuple[float, float, float]:
-    """
-    Estimate head pose (pitch, yaw, roll) in degrees using PnP.
-
-    Returns: (pitch, yaw, roll)
-      pitch > 0 → looking down
-      yaw   > 0 → turned right
-    """
+def _head_pose(lm, w, h):
     p2d = np.array([[lm[i].x * w, lm[i].y * h] for i in _POSE_IDX],
                    dtype=np.float64)
-    cam_matrix = np.array([[w, 0, w / 2],
-                            [0, w, h / 2],
-                            [0, 0, 1   ]], dtype=np.float64)
-    ok, rvec, _ = cv2.solvePnP(
-        _POSE_3D, p2d, cam_matrix, np.zeros((4, 1)),
-        flags=cv2.SOLVEPNP_ITERATIVE
-    )
+    cam = np.array([[w, 0, w / 2],
+                    [0, w, h / 2],
+                    [0, 0, 1   ]], dtype=np.float64)
+    ok, rvec, _ = cv2.solvePnP(_POSE_3D, p2d, cam, np.zeros((4, 1)),
+                                flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok:
         return 0.0, 0.0, 0.0
     R, _ = cv2.Rodrigues(rvec)
@@ -116,79 +118,129 @@ def _head_pose(lm, w: int, h: int) -> tuple[float, float, float]:
     return pitch, yaw, roll
 
 
+def _gaussian(x, mu, sigma):
+    return float(np.exp(-0.5 * ((x - mu) / sigma) ** 2))
+
+
+# ── Sub-score functions ────────────────────────────────────────────────────────
+
+def _ear_score(ear):
+    """1.0 = open, 0.0 = closed, linear ramp between."""
+    if ear >= _EAR_OPEN:   return 1.0
+    if ear <= _EAR_CLOSED: return 0.0
+    return float((ear - _EAR_CLOSED) / (_EAR_OPEN - _EAR_CLOSED))
+
+
+def _yaw_score(yaw, interp_yaw, is_signing):
+    """
+    1.0 within interpreter zone, Gaussian decay beyond it.
+    Signing: always 1.0 (gaze direction irrelevant).
+    """
+    if is_signing:
+        return 1.0
+    yaw_abs = abs(yaw)
+    if yaw_abs <= interp_yaw:
+        return 1.0
+    excess = yaw_abs - interp_yaw
+    return _gaussian(excess, 0.0, _YAW_SIGMA)
+
+
+def _pitch_score_and_mode(pitch):
+    """
+    Returns (score, pitch_mode) where pitch_mode is one of:
+      'camera'   — looking at screen
+      'teacher'  — looking up at teacher / board
+      'book'     — looking down at notes / book
+      'away'     — too far in either direction
+    """
+    # Camera zone: ±_PITCH_CAMERA_HALF
+    if abs(pitch) <= _PITCH_CAMERA_HALF:
+        return 1.0, 'camera'
+
+    # Teacher zone: looking up (negative pitch) within limit
+    if pitch < -_PITCH_CAMERA_HALF:
+        up_angle = abs(pitch) - _PITCH_CAMERA_HALF
+        if abs(pitch) <= _PITCH_TEACHER_MAX:
+            # Smooth ramp: 1.0 at edge of camera zone, _PITCH_ATTENTIVE_SCORE at max
+            t = up_angle / (_PITCH_TEACHER_MAX - _PITCH_CAMERA_HALF)
+            score = 1.0 - (1.0 - _PITCH_ATTENTIVE_SCORE) * t
+            return float(score), 'teacher'
+        else:
+            # Beyond teacher zone — Gaussian decay
+            excess = abs(pitch) - _PITCH_TEACHER_MAX
+            return _gaussian(excess, 0.0, _PITCH_DECAY_SIGMA) * _PITCH_ATTENTIVE_SCORE, 'away'
+
+    # Book zone: looking down (positive pitch) within limit
+    if pitch > _PITCH_CAMERA_HALF:
+        down_angle = pitch - _PITCH_CAMERA_HALF
+        if pitch <= _PITCH_BOOK_MAX:
+            t = down_angle / (_PITCH_BOOK_MAX - _PITCH_CAMERA_HALF)
+            score = 1.0 - (1.0 - _PITCH_ATTENTIVE_SCORE) * t
+            return float(score), 'book'
+        else:
+            excess = pitch - _PITCH_BOOK_MAX
+            return _gaussian(excess, 0.0, _PITCH_DECAY_SIGMA) * _PITCH_ATTENTIVE_SCORE, 'away'
+
+    return 1.0, 'camera'
+
+
+def _gaze_score(gaze):
+    return _gaussian(gaze, _GAZE_CENTER, _GAZE_SIGMA)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENGAGEMENT ESTIMATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EngagementEstimator:
     """
-    Computes a smoothed engagement score E ∈ [0.0, 1.0] from Face Mesh.
+    Computes smoothed engagement score E ∈ [0,1] and engagement_mode string.
 
-    Deaf-classroom calibrations:
-      - Interpreter zone (within ±YAW_INTERPRETER degrees) is not penalised
-      - Downward pitch (reading/board) is not penalised
-      - Active signing: lateral gaze is not penalised
-
-    Parameters:
-        cam_w, cam_h:      Camera resolution (used for landmark scaling)
-        interp_yaw:        Yaw angle of interpreter relative to student (degrees)
-        smoothing_win:     Rolling average window for E
+    engagement_mode values:
+      "ENGAGED"    — looking at screen, eyes open
+      "ATTENTIVE"  — looking at teacher above or book below (still learning)
+      "DISENGAGED" — looking sideways, eyes closed, or face absent
     """
 
-    def __init__(self, cam_w: int = 1280, cam_h: int = 720,
-                 interp_yaw: float = _YAW_INTERPRETER,
-                 smoothing_win: int = SMOOTHING_WIN):
+    def __init__(self, cam_w=1280, cam_h=720,
+                 interp_yaw=_YAW_INTERP,
+                 smoothing_win=SMOOTHING_WIN):
         self.w            = cam_w
         self.h            = cam_h
         self.interp_yaw   = interp_yaw
-        self._ear_buf     = collections.deque(maxlen=10)
-        self._score_buf   = collections.deque(maxlen=smoothing_win)
-        self._blink_ctr   = 0
-        self._blink_flag  = False
-        self.last_score   = 0.5   # neutral default when no face detected
+        self.last_score   = 0.5
+        self.last_mode    = 'ATTENTIVE'   # unknown until first frame
         self.last_pitch   = 0.0
         self.last_yaw     = 0.0
         self.has_iris     = False
 
-    def update(self, lm, is_signing: bool = False) -> float:
-        """
-        Compute engagement for one frame.
+        # Sub-scores exposed for debug overlay
+        self.sub_ear   = 1.0
+        self.sub_yaw   = 1.0
+        self.sub_pitch = 1.0
+        self.sub_gaze  = 1.0
+        self.pitch_zone = 'camera'
 
-        Args:
-            lm:          MediaPipe face mesh landmark list
-            is_signing:  Whether SigningDetector reports active signing
-
-        Returns:
-            E ∈ [0.0, 1.0] — smoothed engagement score
-        """
+    def update(self, lm, is_signing=False):
         w, h = self.w, self.h
 
-        # ── EAR (eye openness) ───────────────────────────────────────────────
-        ear_l = _ear(lm, _L_EAR_IDX, w, h)
-        ear_r = _ear(lm, _R_EAR_IDX, w, h)
-        ear   = (ear_l + ear_r) / 2
-        self._ear_buf.append(ear)
+        # EAR
+        ear = (_ear(lm, _L_EAR_IDX, w, h) + _ear(lm, _R_EAR_IDX, w, h)) / 2.0
+        self.sub_ear = _ear_score(ear)
 
-        # Blink detection
-        if ear < _EAR_BLINK_THRESH:
-            self._blink_ctr += 1
-        else:
-            self._blink_flag  = self._blink_ctr >= _BLINK_CONFIRM
-            self._blink_ctr   = 0
-
-        mean_ear = float(np.mean(self._ear_buf)) if self._ear_buf else 0.25
-
-        # ── Gaze offset ──────────────────────────────────────────────────────
-        gaze = 0.25   # default (no iris data)
+        # Gaze
         self.has_iris = len(lm) >= 478
         if self.has_iris:
             try:
                 gaze = (_gaze_offset(lm, _L_IRIS, _L_EYE, w, h) +
-                        _gaze_offset(lm, _R_IRIS, _R_EYE, w, h)) / 2
+                        _gaze_offset(lm, _R_IRIS, _R_EYE, w, h)) / 2.0
+                self.sub_gaze = _gaze_score(gaze)
             except Exception:
-                pass
+                self.sub_gaze = 0.8
+        else:
+            self.sub_gaze = 0.8
 
-        # ── Head pose ────────────────────────────────────────────────────────
+        # Head pose
         try:
             pitch, yaw, _ = _head_pose(lm, w, h)
         except Exception:
@@ -196,44 +248,54 @@ class EngagementEstimator:
         self.last_pitch = pitch
         self.last_yaw   = yaw
 
-        # ── Score computation ─────────────────────────────────────────────────
-        score = 1.0
+        self.sub_yaw = _yaw_score(yaw, self.interp_yaw, is_signing)
+        self.sub_pitch, self.pitch_zone = _pitch_score_and_mode(pitch)
 
-        # Alertness (EAR)
-        if mean_ear < _EAR_BLINK_THRESH:
-            score -= 0.40
-        elif mean_ear < _EAR_DROWSY_THRESH:
-            score -= 0.15
+        # Weighted combination
+        raw = (_W_EAR   * self.sub_ear   +
+               _W_YAW   * self.sub_yaw   +
+               _W_PITCH * self.sub_pitch +
+               _W_GAZE  * self.sub_gaze)
+        raw = float(np.clip(raw, 0.0, 1.0))
 
-        # Gaze + yaw (only penalise if both lateral gaze AND head turned)
-        # — interpreter zone is OK (within ±interp_yaw)
-        # — during signing, lateral gaze is OK
-        yaw_abs = abs(yaw)
-        if not is_signing:
-            in_interpreter_zone = yaw_abs <= self.interp_yaw
-            if not in_interpreter_zone and gaze > _GAZE_THRESH:
-                score -= min(0.30, (gaze - 0.35) * 1.2)
-
-        # Hard lateral turn (beyond interpreter zone, regardless of signing)
-        if yaw_abs > _YAW_FAR:
-            score -= min(0.30, (yaw_abs - _YAW_FAR) / 20)
-
-        # Downward pitch = reading / board = acceptable
-        # Upward pitch = distracted
-        if pitch < -20:   # looking up
-            score -= min(0.20, (abs(pitch) - 20) / 20)
-
-        # Brief blink
-        if self._blink_flag:
-            score -= 0.05
-
-        score = float(np.clip(score, 0.0, 1.0))
-        self._score_buf.append(score)
-        self.last_score = float(np.mean(self._score_buf))
+        # Exponential smoothing
+        self.last_score = _EMA_ALPHA * raw + (1.0 - _EMA_ALPHA) * self.last_score
+        self.last_mode  = self._classify(yaw, self.pitch_zone, self.sub_ear)
         return self.last_score
 
-    def draw_landmarks(self, frame: np.ndarray, lm) -> None:
-        """Optionally draw EAR landmark dots on the frame for debug view."""
+    def _classify(self, yaw, pitch_zone, ear_score):
+        """Determine engagement mode from pose + eye state."""
+        # Closed eyes → always disengaged
+        if ear_score < 0.3:
+            return 'DISENGAGED'
+        # Large yaw → disengaged regardless of pitch
+        if abs(yaw) > (_YAW_INTERP + _YAW_SIGMA):
+            return 'DISENGAGED'
+        # Teacher or book zone → attentive
+        if pitch_zone in ('teacher', 'book'):
+            return 'ATTENTIVE'
+        # Extreme pitch (away) with large yaw → disengaged
+        if pitch_zone == 'away':
+            return 'DISENGAGED'
+        # Camera zone, yaw OK → engaged
+        return 'ENGAGED'
+
+    def decay(self):
+        """Exponential decay when no face detected."""
+        self.last_score *= _NO_FACE_DECAY
+        self.last_score  = float(max(0.0, self.last_score))
+        self.last_mode   = 'DISENGAGED'
+        return self.last_score
+
+    def engagement_status(self):
+        """
+        Returns (score_0_to_100, mode_string) ready for Firebase.
+        mode_string: 'ENGAGED' | 'ATTENTIVE' | 'DISENGAGED'
+        """
+        score_pct = int(round(self.last_score * 100))
+        return score_pct, self.last_mode
+
+    def draw_landmarks(self, frame, lm):
         for idx in _L_EAR_IDX + _R_EAR_IDX:
             cx = int(lm[idx].x * self.w)
             cy = int(lm[idx].y * self.h)

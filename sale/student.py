@@ -121,7 +121,8 @@ def _fb_patch(path: str, payload: dict):
 
 def db_write(sid, sphys, svis, st, e, alert, bpm, spo2,
              gsr_norm, gsr_tonic, gsr_phasic, skin_temp,
-             gesture=None, is_signing=False, emotions=None):
+             gesture=None, is_signing=False, emotions=None,
+             eng_score=None, eng_status=None):
     sid_lower = sid.lower()
 
     # Stress + sensor data → /students/{sid}/
@@ -134,10 +135,8 @@ def db_write(sid, sphys, svis, st, e, alert, bpm, spo2,
     })).start()
 
     # Engagement → /engagement/{sid}/  (dashboard reads this)
-    eng_score  = int(round(float(e) * 100))
-    eng_status = "ENGAGED" if float(e) > ENG_LOW else "Disengaged"
     threading.Thread(daemon=True, target=_fb_patch, args=(f"engagement/{sid_lower}", {
-        'engagement_score': eng_score,
+        'engagement_score':  eng_score,
         'engagement_status': eng_status,
     })).start()
 
@@ -277,7 +276,10 @@ def main():
         if face_ok:
             estimator.update(lm, is_signing=signing.is_signing)
             estimator.draw_landmarks(frame, lm)
+        else:
+            estimator.decay()   # no face → score drifts toward 0
         E = estimator.last_score
+        eng_score, eng_status = estimator.engagement_status()
 
         # fusion.py — St + alert
         w_phys, w_vis = signing.fusion_shift()
@@ -295,7 +297,8 @@ def main():
                      bpm, spo2, gsr_norm, gsr_tonic, gsr_phasic, skin,
                      gesture=signing.last_gesture if hasattr(signing, 'last_gesture') else None,
                      is_signing=signing.is_signing,
-                     emotions=emotions if emotions else None)
+                     emotions=emotions if emotions else None,
+                     eng_score=eng_score, eng_status=eng_status)
             last_write = now
             sign_tag = " [SIGNING]" if signing.is_signing else ""
             print(f"  [DB] {args.id}  St={St:.3f}  "

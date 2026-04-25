@@ -76,9 +76,14 @@ class Student:
             al    = classify(st_f, e)
             sid   = self.sid.lower()
 
-            # Engagement status string matching what dashboard expects
+            # Engagement status — simulate all three states
             eng_score  = int(round(e * 100))
-            eng_status = ("ENGAGED" if e > ENG_LOW else "Disengaged")
+            if e >= 0.75:
+                eng_status = "ENGAGED"
+            elif e >= 0.45:
+                eng_status = "ATTENTIVE"
+            else:
+                eng_status = "DISENGAGED"
 
             # Occasional random gesture
             gesture = np.random.choice(GESTURES, p=[.08,.08,.05,.05,.05,.05,.05,.59])
