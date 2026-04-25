@@ -4,6 +4,24 @@
 .vscode/launch.json
 .vscode/ipch
 venv/
+.venv/
 
-# Firebase credentials — NEVER commit
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Credentials & secrets — NEVER commit
 **/serviceAccountKey.json
+sale/.env
+
+# Large data & model artefacts
+sale/data_collected/
+sale/models/*.pkl
+sale/models/*.csv
+sale/models/*.png
+
+# Misc
+.DS_Store
+firebase-debug.log
+invoice.pdf

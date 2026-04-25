@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
-//  FIREBASE RTDB — appends real s01 + simulated s02-s05 data
-//  under timestamped keys via multi-path PATCH
-//  Path: smartglove/{sid}/{YYYYMMDD_HHMMSS_mmm}/raw/, processed/
+//  FIREBASE RTDB — overwrites /glove/{sid} with latest readings.
+//  No timestamps — SVC model runs per-frame, history not needed.
+//  All 5 students batched in one PATCH to /glove.json
 // ═══════════════════════════════════════════════════════════════
 
 #include <Arduino.h>
@@ -10,7 +10,6 @@
 #include <HTTPClient.h>
 #include <esp_wifi.h>
 #include <esp_random.h>
-#include <time.h>
 
 #include "firebase_config.h"
 #include "firebase_rtdb.h"
@@ -23,81 +22,32 @@ extern float              g_tempC;
 extern SemaphoreHandle_t  i2cMutex;
 
 // ═══════════════════════════════════════════════════════════════
-//  NTP — generates YYYYMMDD_HHMMSS_mmm timestamp keys
-// ═══════════════════════════════════════════════════════════════
-static bool ntpSynced = false;
-
-static void syncNTP() {
-  configTzTime("UTC-5:30", "pool.ntp.org", "time.google.com");
-  Serial.println("INFO:Waiting for NTP sync...");
-  struct tm t;
-  int tries = 0;
-  while (!getLocalTime(&t) && tries < 20) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-    tries++;
-  }
-  if (getLocalTime(&t)) {
-    ntpSynced = true;
-    Serial.printf("INFO:NTP synced: %04d-%02d-%02d %02d:%02d:%02d\n",
-                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                  t.tm_hour, t.tm_min, t.tm_sec);
-  } else {
-    Serial.println("WARN:NTP sync failed — using millis fallback");
-  }
-}
-
-static void buildTimestampKey(char *buf, size_t len) {
-  if (ntpSynced) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm t;
-    localtime_r(&tv.tv_sec, &t);
-    int ms = tv.tv_usec / 1000;
-    snprintf(buf, len, "%04d%02d%02d_%02d%02d%02d_%03d",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-             t.tm_hour, t.tm_min, t.tm_sec, ms);
-  } else {
-    snprintf(buf, len, "%lu", (unsigned long)millis());
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  Simulation — per-student fixed offsets + random noise
+//  Simulation — per-student fixed offsets + small noise
 // ═══════════════════════════════════════════════════════════════
 
 struct StudentOffset {
-  float accel[3];   // x, y, z (g)
-  float gyro[3];    // x, y, z (°/s)
-  float rpy[3];     // roll, pitch, yaw (°)
-  int   gsrRaw;     // ADC counts
+  int   gsrRaw;
+  float gsrKal;
   int   bpm;
   int   spo2;
-  long  ir;
-  long  red;
   float tempC;
 };
 
 static const StudentOffset offsets[4] = {
   // s02: slightly elevated HR, warmer
-  { {0.02f, -0.03f, 0.01f}, {0.5f, -0.3f, 0.6f}, {3.0f, -2.0f, 5.0f},
-    120, 8, -1, 1500, 1000, 0.8f },
+  {  120,  120.0f,  8, -1,  0.8f },
   // s03: lower HR, cooler
-  { {-0.04f, 0.02f, -0.01f}, {-0.6f, 0.4f, -0.2f}, {-5.0f, 3.0f, -7.0f},
-    -150, -10, 1, -1800, -1200, -1.2f },
+  { -150, -150.0f, -10, 1, -1.2f },
   // s04: higher GSR (stressed), slightly higher HR
-  { {0.03f, 0.04f, -0.03f}, {0.3f, -0.7f, 0.4f}, {6.0f, -4.0f, 8.0f},
-    180, 5, -2, 800, 600, 0.5f },
+  {  180,  180.0f,  5, -2,  0.5f },
   // s05: calm, lower HR
-  { {-0.01f, -0.02f, 0.04f}, {-0.4f, 0.2f, -0.5f}, {-2.0f, 1.0f, -4.0f},
-    -100, -7, 2, -1000, -800, -0.6f },
+  { -100, -100.0f, -7,  2, -0.6f },
 };
 
 static float noise(float amp) {
   return ((float)esp_random() / (float)UINT32_MAX) * 2.0f * amp - amp;
 }
-static int noiseI(int amp) {
-  return (int)noise((float)amp);
-}
+static int noiseI(int amp) { return (int)noise((float)amp); }
 static float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -106,7 +56,7 @@ static int clampi(int v, int lo, int hi) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  WiFi — managed inside firebaseTask
+//  WiFi stub (connection managed inside firebaseTask)
 // ═══════════════════════════════════════════════════════════════
 void wifiConnect() {}
 
@@ -117,14 +67,12 @@ void firebaseTask(void *pv) {
   Serial.println("INFO:Firebase task waiting 5s for sensors to stabilise...");
   vTaskDelay(pdMS_TO_TICKS(5000));
 
-  // ── Start WiFi ─────────────────────────────────────────────
   Serial.printf("INFO:Heap before WiFi: %lu\n", (unsigned long)ESP.getFreeHeap());
   WiFi.mode(WIFI_STA);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.println("INFO:WiFi started");
-  Serial.printf("INFO:Heap after WiFi.begin: %lu\n", (unsigned long)ESP.getFreeHeap());
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
@@ -135,7 +83,6 @@ void firebaseTask(void *pv) {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("INFO:WiFi connected, IP=");
     Serial.println(WiFi.localIP());
-    syncNTP();
   } else {
     Serial.println("WARN:WiFi failed — will keep retrying");
   }
@@ -143,179 +90,98 @@ void firebaseTask(void *pv) {
   WiFiClientSecure sslClient;
   sslClient.setInsecure();
 
-  // ── Static JSON buffer (avoids heap/PSRAM issues) ──────────
-  static char json[5120];
-  static char tsKey[32];
+  // Buffer: 5 students × ~120 bytes each + wrapper ~50 bytes = ~700 bytes
+  static char json[1024];
   const size_t JSON_CAP = sizeof(json);
-  Serial.printf("INFO:JSON buffer %u bytes (static)\n", (unsigned)JSON_CAP);
 
   for (;;) {
-    // ── Wait for WiFi ────────────────────────────────────────
     if (WiFi.status() != WL_CONNECTED) {
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
 
-    if (!ntpSynced) syncNTP();
-
-    // ── Snapshot all sensor globals ──────────────────────────
-    int  fRaw[5], fKal[5];
-    int  gsrRawLocal;
-    uint8_t gestureLocal;
-
+    // ── Snapshot sensor globals ───────────────────────────────
+    int gsrRawLocal;
     portENTER_CRITICAL(&g_flexMux);
-    for (int i = 0; i < 5; i++) {
-      fRaw[i] = flexRaw[i];
-      fKal[i] = flexKal[i];
-    }
-    gsrRawLocal  = g_gsrRaw;
-    gestureLocal = g_stableGesture;
+    gsrRawLocal = g_gsrRaw;
     portEXIT_CRITICAL(&g_flexMux);
 
-    float aX = accX, aY = accY, aZ = accZ;
-    float gX = gyX,  gY = gyY,  gZ = gyZ;
-    float r  = roll, p  = pitch, y = yaw;
+    int      bpm    = outBPM;
+    int32_t  spo2   = lastValidSPO2;
+    float    tempC  = g_tempC;
+    float    safeT  = isnan(tempC) ? 32.0f : tempC;
+    float    gsrKal = gsrKF.x;
+    float    vGSR   = gsrRawLocal * (3.3f / 4095.0f);
 
-    int      bpm   = outBPM;
-    long     ir    = outIR;
-    int32_t  spo2  = lastValidSPO2;
-    uint32_t red   = lastRedV;
-    float    tempC = g_tempC;
-    HandPos  hp    = g_handPos;
-
-    float gsrKalVal = gsrKF.x;
-    float vGSR      = gsrRawLocal * (3.3f / 4095.0f);
-    float safeTemp   = isnan(tempC) ? 0.0f : tempC;
-
-    const char* handStr    = (hp == HAND_UP) ? "UP"
-                           : (hp == HAND_DOWN) ? "DOWN" : "REST";
-    const char* gestureTxt = gestureToText(gestureLocal);
-
-    // ── Build timestamp key (shared across all students) ──────
-    buildTimestampKey(tsKey, sizeof(tsKey));
-
-    // ── Build batched JSON for all 5 students ────────────────
+    // ── Build JSON: { "s01": {...}, "s02": {...}, ... } ───────
     int pos = 0;
 
-    // ── s01: real data (with flex) ───────────────────────────
+    // s01 — real sensor data
     pos += snprintf(json + pos, JSON_CAP - pos,
-      "{\"s01/%s\":{"
-        "\"raw\":{"
-          "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-          "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-          "\"max30102\":{\"ir\":%ld,\"red\":%lu},"
-          "\"gsr\":%d,"
-          "\"flex\":{\"ring\":%d,\"thumb\":%d,\"middle\":%d,\"pinky\":%d,\"index\":%d},"
-          "\"skin_temp_c\":%.2f"
-        "},"
-        "\"processed\":{"
-          "\"imu\":{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f},"
-          "\"hr\":{\"bpm\":%d,\"spo2\":%d},"
-          "\"gsr\":{\"kalman\":%.1f,\"voltage\":%.3f},"
-          "\"flex\":{\"ring\":%d,\"thumb\":%d,\"middle\":%d,\"pinky\":%d,\"index\":%d},"
+      "{"
+        "\"s01\":{"
+          "\"gsr_raw\":%d,"
+          "\"gsr_kal\":%.1f,"
+          "\"gsr_voltage\":%.3f,"
+          "\"bpm\":%d,"
+          "\"spo2\":%d,"
           "\"skin_temp_c\":%.2f,"
-          "\"gesture\":{\"hand_position\":\"%s\",\"gesture\":\"%s\"}"
-        "},"
-        "\"device_uptime_ms\":%lu,"
-        "\"timestamp\":{\".sv\":\"timestamp\"}"
-      "}",
-      tsKey,
-      aX, aY, aZ,
-      gX, gY, gZ,
-      ir, (unsigned long)red,
+          "\"ts\":{\".sv\":\"timestamp\"}"
+        "}",
       gsrRawLocal,
-      fRaw[0], fRaw[1], fRaw[2], fRaw[3], fRaw[4],
-      safeTemp,
-      r, p, y,
-      bpm, (int)spo2,
-      gsrKalVal, vGSR,
-      fKal[0], fKal[1], fKal[2], fKal[3], fKal[4],
-      safeTemp,
-      handStr, gestureTxt,
-      (unsigned long)millis()
+      gsrKal,
+      vGSR,
+      bpm,
+      (int)spo2,
+      safeT
     );
 
-    // ── s02–s05: simulated (no flex) ─────────────────────────
-    static const char *simIds[] = {"s02", "s03", "s04", "s05"};
+    // s02–s05 — simulated
+    static const char *simIds[] = { "s02", "s03", "s04", "s05" };
     for (int s = 0; s < 4; s++) {
       const StudentOffset &o = offsets[s];
 
-      float sAx = aX + o.accel[0] + noise(0.02f);
-      float sAy = aY + o.accel[1] + noise(0.02f);
-      float sAz = aZ + o.accel[2] + noise(0.02f);
-      float sGx = gX + o.gyro[0]  + noise(0.5f);
-      float sGy = gY + o.gyro[1]  + noise(0.5f);
-      float sGz = gZ + o.gyro[2]  + noise(0.5f);
-      float sR  = r  + o.rpy[0]   + noise(2.0f);
-      float sP  = p  + o.rpy[1]   + noise(1.5f);
-      float sY  = y  + o.rpy[2]   + noise(3.0f);
-
-      int sGsr  = clampi(gsrRawLocal + o.gsrRaw + noiseI(40), 0, 4095);
-      int sBpm  = clampi(bpm + o.bpm + noiseI(3), 45, 120);
-      int sSpo2 = clampi((int)spo2 + o.spo2 + noiseI(1), 88, 100);
-
-      long sIrRaw  = ir + o.ir + (long)noiseI(500);
-      long sIr     = sIrRaw < 0 ? 0 : sIrRaw;
-      long sRedRaw = (long)red + o.red + (long)noiseI(400);
-      unsigned long sRed = sRedRaw < 0 ? 0 : (unsigned long)sRedRaw;
-
-      float sTemp   = clampf(safeTemp + o.tempC + noise(0.3f), 30.0f, 42.0f);
-      float sGsrKal = clampf(gsrKalVal + (float)o.gsrRaw + noise(20.0f), 0.0f, 4095.0f);
+      int   sGsr    = clampi(gsrRawLocal + o.gsrRaw + noiseI(30), 0, 4095);
+      float sGsrKal = clampf(gsrKal + o.gsrKal + noise(15.0f), 0.0f, 4095.0f);
       float sVgsr   = sGsr * (3.3f / 4095.0f);
+      int   sBpm    = clampi(bpm  + o.bpm  + noiseI(3), 45, 120);
+      int   sSpo2   = clampi((int)spo2 + o.spo2 + noiseI(1), 88, 100);
+      float sTemp   = clampf(safeT + o.tempC + noise(0.2f), 30.0f, 42.0f);
 
       pos += snprintf(json + pos, JSON_CAP - pos,
-        ",\"%s/%s\":{"
-          "\"raw\":{"
-            "\"accel\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-            "\"gyro\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-            "\"max30102\":{\"ir\":%ld,\"red\":%lu},"
-            "\"gsr\":%d,"
-            "\"skin_temp_c\":%.2f"
-          "},"
-          "\"processed\":{"
-            "\"imu\":{\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f},"
-            "\"hr\":{\"bpm\":%d,\"spo2\":%d},"
-            "\"gsr\":{\"kalman\":%.1f,\"voltage\":%.3f},"
-            "\"skin_temp_c\":%.2f,"
-            "\"gesture\":{\"hand_position\":\"%s\",\"gesture\":\"%s\"}"
-          "},"
-          "\"device_uptime_ms\":%lu,"
-          "\"timestamp\":{\".sv\":\"timestamp\"}"
+        ",\"%s\":{"
+          "\"gsr_raw\":%d,"
+          "\"gsr_kal\":%.1f,"
+          "\"gsr_voltage\":%.3f,"
+          "\"bpm\":%d,"
+          "\"spo2\":%d,"
+          "\"skin_temp_c\":%.2f,"
+          "\"ts\":{\".sv\":\"timestamp\"}"
         "}",
-        simIds[s], tsKey,
-        sAx, sAy, sAz,
-        sGx, sGy, sGz,
-        sIr, sRed,
-        sGsr,
-        sTemp,
-        sR, sP, sY,
-        sBpm, sSpo2,
-        sGsrKal, sVgsr,
-        sTemp,
-        handStr, gestureTxt,
-        (unsigned long)millis()
+        simIds[s],
+        sGsr, sGsrKal, sVgsr,
+        sBpm, sSpo2, sTemp
       );
     }
 
-    // Close outer object
     pos += snprintf(json + pos, JSON_CAP - pos, "}");
 
-    Serial.printf("INFO:JSON size=%d bytes\n", pos);
+    Serial.printf("INFO:Firebase JSON %d bytes\n", pos);
 
-    // ── PATCH to /.json (all 5 under timestamps) ─────────────
+    // ── PATCH to /glove.json (overwrites each student node) ───
     HTTPClient http;
-    String url = String(FIREBASE_DB_URL) + "/.json";
+    String url = String(FIREBASE_DB_URL) + "/glove.json?auth=" + FIREBASE_AUTH;
     http.begin(sslClient, url);
     http.addHeader("Content-Type", "application/json");
 
     int httpCode = http.sendRequest("PATCH", json);
     if (httpCode == 200) {
-      // success — silent
+      Serial.println("INFO:Firebase OK");
     } else if (httpCode > 0) {
       Serial.printf("WARN:Firebase HTTP %d\n", httpCode);
     } else {
       Serial.printf("WARN:Firebase err: %s\n",
-                     http.errorToString(httpCode).c_str());
+                    http.errorToString(httpCode).c_str());
     }
     http.end();
 
