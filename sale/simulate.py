@@ -16,9 +16,11 @@ Student profiles:
 
 import json, math, threading, time, urllib.request
 import numpy as np
-from config import SUPABASE_URL, SUPABASE_KEY, STRESS_HIGH, STRESS_MED, ENG_LOW
+from config import FIREBASE_DB, FIREBASE_AUTH, STRESS_HIGH, STRESS_MED, ENG_LOW
 
 WRITE_INTERVAL = 5  # seconds
+
+GESTURES = ['YES', 'NO', 'QUESTION', 'INC AC', 'DEC AC', 'INC LIGHT', 'DEC LIGHT', None]
 
 def classify(st, e):
     if st >= STRESS_HIGH: return 'high'
@@ -26,18 +28,17 @@ def classify(st, e):
     if e  <= ENG_LOW:     return 'disengaged'
     return 'normal'
 
-def post(payload):
+def fb_patch(path, payload):
     try:
         data = json.dumps(payload).encode()
-        req  = urllib.request.Request(
-            f"{SUPABASE_URL}/rest/v1/stress_scores", data=data,
-            headers={"apikey":SUPABASE_KEY,"Authorization":f"Bearer {SUPABASE_KEY}",
-                     "Content-Type":"application/json","Prefer":"return=minimal"},
-            method="POST")
+        url  = f"{FIREBASE_DB}/{path}.json?auth={FIREBASE_AUTH}"
+        req  = urllib.request.Request(url, data=data,
+                                      headers={"Content-Type": "application/json"},
+                                      method="PATCH")
         urllib.request.urlopen(req, timeout=2.0)
         return True
     except Exception as e:
-        print(f"  [WARN] {e}"); return False
+        print(f"  [WARN] Firebase write failed ({path}): {e}"); return False
 
 
 class Student:
@@ -69,13 +70,37 @@ class Student:
         print(f"  [{self.sid}] {self.name:10s} started  base_St={self.base_st:.2f}  base_E={self.base_e:.2f}")
         while True:
             st, e = self.tick()
-            sphys = float(np.clip(st+np.random.randn()*.04, 0,1))
-            svis  = float(np.clip(st*.4+np.random.randn()*.05, 0,1))
-            st_f  = round(.70*sphys+.30*svis, 4)
+            sphys = float(np.clip(st + np.random.randn() * .04, 0, 1))
+            svis  = float(np.clip(st * .4 + np.random.randn() * .05, 0, 1))
+            st_f  = round(.70 * sphys + .30 * svis, 4)
             al    = classify(st_f, e)
-            ok    = post({'student_id':self.sid,'sphys':round(sphys,4),
-                          'svis':round(svis,4),'st':st_f,'e':round(e,4),'alert':al})
-            ts    = time.strftime('%H:%M:%S')
+            sid   = self.sid.lower()
+
+            # Engagement status string matching what dashboard expects
+            eng_score  = int(round(e * 100))
+            eng_status = ("ENGAGED" if e > ENG_LOW else "Disengaged")
+
+            # Occasional random gesture
+            gesture = np.random.choice(GESTURES, p=[.08,.08,.05,.05,.05,.05,.05,.59])
+
+            ok1 = fb_patch(f"students/{sid}", {
+                'sphys': round(sphys, 4), 'svis': round(svis, 4),
+                'st': st_f, 'e': round(e, 4), 'alert': al,
+                'ts': {'.sv': 'timestamp'},
+            })
+            ok2 = fb_patch(f"engagement/{sid}", {
+                'engagement_score': eng_score,
+                'engagement_status': eng_status,
+            })
+            ok3 = True
+            if gesture:
+                ok3 = fb_patch(f"sign/{sid}", {
+                    'label': gesture,
+                    'confidence': round(float(np.random.uniform(0.75, 0.99)), 3),
+                })
+
+            ok  = ok1 and ok2 and ok3
+            ts  = time.strftime('%H:%M:%S')
             print(f"  [{self.sid}] {ts}  St={st_f:.3f}  E={e:.3f}  {al.upper():<12}  {'OK' if ok else 'FAIL'}")
             time.sleep(WRITE_INTERVAL)
 

@@ -26,12 +26,9 @@ MODELS_DIR = os.path.join(ROOT, "models")
 MODEL_PATH = os.path.join(MODELS_DIR, "stress_model.pkl")
 NORM_PATH  = os.path.join(MODELS_DIR, "norm_stats.csv")
 
-# ── Supabase — loaded from .env, never hardcoded ───────────────────────────────
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("[WARN] Supabase credentials not found in .env — DB writes disabled.")
+# ── Firebase RTDB ─────────────────────────────────────────────────────────────
+FIREBASE_DB   = "https://smart-classroom-981e2-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_AUTH = "mYcjkCxN949mjqC8qbJLeZdO8Y3Iby6DwLTCeLXD"
 
 # ── Physiological bounds ───────────────────────────────────────────────────────
 BPM_MIN, BPM_MAX   = 40, 120

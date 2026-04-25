@@ -1,72 +1,56 @@
 """
 SALE — Environment Controller Simulator
 =========================================
-Reads latest stress scores from Supabase (stress_scores table),
+Reads latest stress scores from Firebase RTDB (/students/),
 computes a classroom composite stress, then writes control decisions
-to Firebase RTDB at /environment/ every POLL_INTERVAL seconds.
+back to Firebase at /environment/ every POLL_INTERVAL seconds.
+
+Firebase paths read:
+    /students/{sid}/st        — fused stress score [0,1]
+    /students/{sid}/alert     — alert level
 
 Firebase paths written:
-    /environment/ac           — "on" | "off"
-    /environment/lighting     — "bright" | "dim" | "normal"
-    /environment/fan          — "on" | "off"
-    /environment/temp_target  — int °C
+    /environment/ac           — "ON" | "OFF"
+    /environment/ac_setpoint  — int °C
+    /environment/lighting     — "bright" | "normal" | "dim"
+    /environment/fan          — "ON" | "OFF"
     /environment/composite    — float ∈ [0,1]
+    /environment/temp         — simulated room temp (°C)
+    /environment/humidity     — simulated humidity (%)
     /environment/alert_counts — {"high":N,"medium":N,"disengaged":N,"normal":N}
     /environment/ts           — Firebase server timestamp
-    /stress/{sid}/stress_level — "high"|"medium"|"disengaged"|"normal"
 
 Usage:
     python env_sim.py
     python env_sim.py --interval 10
 """
 
-import argparse, json, os, sys, time, urllib.request, urllib.error
+import argparse, json, math, os, random, time, urllib.request, urllib.error
 
-# ── load .env ────────────────────────────────────────────────────────────────
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-if os.path.exists(_env_path):
-    for _line in open(_env_path):
-        _line = _line.strip()
-        if _line and not _line.startswith('#') and '=' in _line:
-            _k, _v = _line.split('=', 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
-
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
-FIREBASE_DB  = "https://smart-classroom-981e2-default-rtdb.asia-southeast1.firebasedatabase.app"
+FIREBASE_DB   = "https://smart-classroom-981e2-default-rtdb.asia-southeast1.firebasedatabase.app"
 FIREBASE_AUTH = "mYcjkCxN949mjqC8qbJLeZdO8Y3Iby6DwLTCeLXD"
 
-POLL_INTERVAL = 5   # seconds — matches WRITE_INTERVAL in student.py
+POLL_INTERVAL = 5
+STUDENTS      = ["s01", "s02", "s03", "s04", "s05"]
 
-STUDENTS = ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08"]
-
-# ── Supabase helpers ─────────────────────────────────────────────────────────
-
-def sb_latest_scores() -> dict[str, dict]:
-    """Return {sid: {st, sphys, svis, e, alert}} for the most recent row per student."""
-    if not SUPABASE_URL:
-        return {}
-    results = {}
-    for sid in STUDENTS:
-        try:
-            url = (f"{SUPABASE_URL}/rest/v1/stress_scores"
-                   f"?student_id=eq.{sid}&order=created_at.desc&limit=1")
-            req = urllib.request.Request(url, headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            })
-            resp = urllib.request.urlopen(req, timeout=3.0)
-            rows = json.loads(resp.read().decode())
-            if rows:
-                results[sid] = rows[0]
-        except Exception:
-            pass
-    return results
+# Simulated room environment (drifts slowly like a real classroom)
+_sim_temp     = 26.0
+_sim_humidity = 62.0
 
 
-# ── Firebase helpers ─────────────────────────────────────────────────────────
+# ── Firebase helpers ──────────────────────────────────────────────────────────
 
-def fb_patch(path: str, payload: dict):
+def fb_get(path):
+    try:
+        url  = f"{FIREBASE_DB}/{path}.json?auth={FIREBASE_AUTH}"
+        req  = urllib.request.Request(url)
+        resp = urllib.request.urlopen(req, timeout=3.0)
+        return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"  [FB] Read failed ({path}): {e}")
+        return None
+
+def fb_patch(path, payload):
     try:
         data = json.dumps(payload).encode()
         url  = f"{FIREBASE_DB}/{path}.json?auth={FIREBASE_AUTH}"
@@ -78,47 +62,76 @@ def fb_patch(path: str, payload: dict):
         print(f"  [FB] Write failed ({path}): {e}")
 
 
+# ── Read all students from Firebase ──────────────────────────────────────────
+
+def read_student_scores() -> dict:
+    """Returns {sid: {st, alert}} for each student that has data."""
+    data = fb_get("students")
+    if not data:
+        return {}
+    scores = {}
+    for sid in STUDENTS:
+        row = data.get(sid)
+        if row and 'st' in row:
+            scores[sid] = {'st': float(row['st']), 'alert': row.get('alert', 'normal')}
+    return scores
+
+
+# ── Simulated DHT22 sensor ────────────────────────────────────────────────────
+
+def sim_environment(ac_on: bool, ac_setpoint: int) -> tuple:
+    """Slowly drift simulated room temp and humidity."""
+    global _sim_temp, _sim_humidity
+    target_temp = ac_setpoint if ac_on else 28.0
+    _sim_temp    += (target_temp - _sim_temp) * 0.05 + random.uniform(-0.05, 0.05)
+    _sim_humidity += (65.0 - _sim_humidity)  * 0.02 + random.uniform(-0.2, 0.2)
+    _sim_temp     = max(18.0, min(35.0, _sim_temp))
+    _sim_humidity = max(40.0, min(90.0, _sim_humidity))
+    return round(_sim_temp, 1), round(_sim_humidity, 1)
+
+
 # ── Environment decision logic ────────────────────────────────────────────────
 
-def decide_environment(scores: dict[str, dict]) -> dict:
+def decide_environment(scores: dict) -> dict:
     """
     Derive AC/lighting/fan targets from classroom aggregate stress.
 
-    Rules (simple but explainable):
-      composite ≥ 0.65 → AC on, fan on, dim lighting, temp_target 22°C
-      composite ≥ 0.45 → AC on, fan off, normal lighting, temp_target 23°C
-      else              → AC off, fan off, bright lighting, temp_target 24°C
+      composite >= 0.65 → AC ON,  fan ON,  dim lighting,    22°C
+      composite >= 0.45 → AC ON,  fan OFF, normal lighting,  23°C
+      else              → AC OFF, fan OFF, bright lighting,  24°C
     """
     if not scores:
-        return {
-            "ac": "off", "lighting": "normal", "fan": "off",
-            "temp_target": 24, "composite": 0.5,
-            "alert_counts": {"high": 0, "medium": 0, "disengaged": 0, "normal": 0},
-            "ts": {".sv": "timestamp"},
-        }
-
-    sts    = [float(v.get('st', 0.5)) for v in scores.values()]
-    composite = sum(sts) / len(sts)
-
-    alert_counts = {"high": 0, "medium": 0, "disengaged": 0, "normal": 0}
-    for v in scores.values():
-        a = v.get('alert', 'normal')
-        if a in alert_counts:
-            alert_counts[a] += 1
-
-    if composite >= 0.65:
-        ac, fan, lighting, temp = "on",  "on",  "dim",    22
-    elif composite >= 0.45:
-        ac, fan, lighting, temp = "on",  "off", "normal", 23
+        composite = 0.0
+        alert_counts = {"high": 0, "medium": 0, "disengaged": 0, "normal": 0}
+        ac, fan, lighting, setpoint = "OFF", "OFF", "bright", 24
     else:
-        ac, fan, lighting, temp = "off", "off", "bright", 24
+        sts = [v['st'] for v in scores.values()]
+        composite = sum(sts) / len(sts)
+        alert_counts = {"high": 0, "medium": 0, "disengaged": 0, "normal": 0}
+        for v in scores.values():
+            a = v.get('alert', 'normal')
+            if a in alert_counts:
+                alert_counts[a] += 1
+
+        if composite >= 0.65:
+            ac, fan, lighting, setpoint = "ON",  "ON",  "dim",    22
+        elif composite >= 0.45:
+            ac, fan, lighting, setpoint = "ON",  "OFF", "normal", 23
+        else:
+            ac, fan, lighting, setpoint = "OFF", "OFF", "bright", 24
+
+    temp, humidity = sim_environment(ac == "ON", setpoint)
 
     return {
-        "ac": ac, "lighting": lighting, "fan": fan,
-        "temp_target": temp,
-        "composite": round(composite, 4),
+        "ac":           ac,
+        "ac_setpoint":  setpoint,
+        "lighting":     lighting,
+        "fan":          fan,
+        "composite":    round(composite, 4),
+        "temp":         temp,
+        "humidity":     humidity,
         "alert_counts": alert_counts,
-        "ts": {".sv": "timestamp"},
+        "ts":           {".sv": "timestamp"},
     }
 
 
@@ -126,39 +139,29 @@ def decide_environment(scores: dict[str, dict]) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--interval', type=int, default=POLL_INTERVAL,
-                    help='Poll interval in seconds (default 5)')
+    ap.add_argument('--interval', type=int, default=POLL_INTERVAL)
     args = ap.parse_args()
 
-    if not SUPABASE_URL:
-        print("[WARN] SUPABASE_URL not set — stress data will be empty.")
-    print("="*55)
+    print("=" * 55)
     print("  SALE — Environment Controller Simulator")
-    print("="*55)
-    print(f"  Poll interval : {args.interval}s")
-    print(f"  Supabase      : {SUPABASE_URL or '(not configured)'}")
-    print(f"  Firebase      : {FIREBASE_DB}/environment/")
+    print("=" * 55)
+    print(f"  Source   : Firebase /students/")
+    print(f"  Output   : Firebase /environment/")
+    print(f"  Interval : {args.interval}s")
     print("  Running — Ctrl+C to quit\n")
 
     while True:
-        scores = sb_latest_scores()
+        scores = read_student_scores()
         env    = decide_environment(scores)
 
-        # Write aggregate environment node
         fb_patch("environment", env)
 
-        # Write per-student stress level to /stress/{sid}/
-        stress_patch = {}
-        for sid, row in scores.items():
-            stress_patch[sid.lower()] = {"stress_level": row.get('alert', 'normal')}
-        if stress_patch:
-            fb_patch("stress", stress_patch)
-
-        composite = env['composite']
-        counts    = env['alert_counts']
+        counts = env['alert_counts']
         print(
-            f"  [ENV] composite={composite:.3f}  "
-            f"AC={env['ac']} light={env['lighting']} T={env['temp_target']}°C  "
+            f"  [ENV] composite={env['composite']:.3f}  "
+            f"AC={env['ac']} ({env['ac_setpoint']}°C)  "
+            f"light={env['lighting']}  "
+            f"T={env['temp']}°C  H={env['humidity']}%  "
             f"| high={counts['high']} med={counts['medium']} "
             f"diseng={counts['disengaged']} norm={counts['normal']}"
         )

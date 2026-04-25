@@ -22,8 +22,8 @@ import cv2, mediapipe as mp, numpy as np, urllib.request, urllib.error
 warnings.filterwarnings('ignore')
 
 from config import (NORM_PATH, CAM_INDEX, FRAME_W, FRAME_H,
-                    WRITE_INTERVAL, SUPABASE_URL, SUPABASE_KEY,
-                    STRESS_HIGH, STRESS_MED)
+                    WRITE_INTERVAL, FIREBASE_DB, FIREBASE_AUTH,
+                    STRESS_HIGH, STRESS_MED, ENG_LOW)
 
 # ── SALE modules ──────────────────────────────────────────────────────────────
 from physical   import GSRNormaliser, load_model, load_norm_stats, predict_sphys
@@ -106,36 +106,59 @@ class GloveSerial:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUPABASE WRITER
+# FIREBASE WRITER
 # ══════════════════════════════════════════════════════════════════════════════
-def _sb_post(table: str, payload: dict):
-    if not SUPABASE_URL:
-        return
+def _fb_patch(path: str, payload: dict):
     try:
         data = json.dumps(payload).encode()
-        req  = urllib.request.Request(
-            f"{SUPABASE_URL}/rest/v1/{table}", data=data,
-            headers={"apikey": SUPABASE_KEY,
-                     "Authorization": f"Bearer {SUPABASE_KEY}",
-                     "Content-Type": "application/json",
-                     "Prefer": "return=minimal"},
-            method="POST")
+        url  = f"{FIREBASE_DB}/{path}.json?auth={FIREBASE_AUTH}"
+        req  = urllib.request.Request(url, data=data,
+                                      headers={"Content-Type": "application/json"},
+                                      method="PATCH")
         urllib.request.urlopen(req, timeout=2.0)
     except Exception as e:
-        print(f"  [DB] Write failed ({table}): {e}")
+        print(f"  [FB] Write failed ({path}): {e}")
 
 def db_write(sid, sphys, svis, st, e, alert, bpm, spo2,
-             gsr_norm, gsr_tonic, gsr_phasic, skin_temp):
-    threading.Thread(daemon=True, target=_sb_post, args=('stress_scores', {
-        'student_id': sid, 'sphys': round(float(sphys), 4),
-        'svis': round(float(svis), 4), 'st': round(float(st), 4),
-        'e': round(float(e), 4), 'alert': alert})).start()
-    threading.Thread(daemon=True, target=_sb_post, args=('sensor_readings', {
-        'student_id': sid, 'bpm': round(float(bpm), 1),
-        'spo2': round(float(spo2), 1), 'gsr_norm': round(float(gsr_norm), 4),
-        'gsr_tonic': round(float(gsr_tonic), 4),
-        'gsr_phasic': round(float(gsr_phasic), 4),
-        'skin_temp_c': round(float(skin_temp), 2), 'source': 'demo'})).start()
+             gsr_norm, gsr_tonic, gsr_phasic, skin_temp,
+             gesture=None, is_signing=False, emotions=None):
+    sid_lower = sid.lower()
+
+    # Stress + sensor data → /students/{sid}/
+    threading.Thread(daemon=True, target=_fb_patch, args=(f"students/{sid_lower}", {
+        'sphys': round(float(sphys), 4), 'svis': round(float(svis), 4),
+        'st': round(float(st), 4), 'e': round(float(e), 4), 'alert': alert,
+        'bpm': round(float(bpm), 1), 'spo2': round(float(spo2), 1),
+        'gsr_norm': round(float(gsr_norm), 4), 'skin_temp_c': round(float(skin_temp), 2),
+        'ts': {'.sv': 'timestamp'},
+    })).start()
+
+    # Engagement → /engagement/{sid}/  (dashboard reads this)
+    eng_score  = int(round(float(e) * 100))
+    eng_status = "ENGAGED" if float(e) > ENG_LOW else "Disengaged"
+    threading.Thread(daemon=True, target=_fb_patch, args=(f"engagement/{sid_lower}", {
+        'engagement_score': eng_score,
+        'engagement_status': eng_status,
+    })).start()
+
+    # Sign gesture → /sign/{sid}/  (dashboard reads this)
+    if gesture:
+        threading.Thread(daemon=True, target=_fb_patch, args=(f"sign/{sid_lower}", {
+            'label': gesture,
+            'confidence': 1.0,
+        })).start()
+
+    # Emotion → /emotion/{sid}/  (dominant label + full probabilities)
+    if emotions:
+        dominant = max(emotions, key=emotions.get)
+        total    = sum(emotions.values()) + 1e-9
+        probs    = {k: round(v / total, 4) for k, v in emotions.items()}
+        threading.Thread(daemon=True, target=_fb_patch, args=(f"emotion/{sid_lower}", {
+            'emotion_label': dominant,
+            'stress_score':  round(float(svis), 4),
+            'probabilities': probs,
+            'ts':            {'.sv': 'timestamp'},
+        })).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,9 +190,9 @@ def main():
     ap.add_argument('--id',     default='S01')
     ap.add_argument('--cam',    type=int, default=CAM_INDEX)
     ap.add_argument('--port',   default=None, help='Serial port for real glove')
-    ap.add_argument('--source', default='demo',
+    ap.add_argument('--source', default='firebase',
                     choices=['demo', 'serial', 'firebase'],
-                    help='Glove data source: demo | serial | firebase')
+                    help='Glove data source: firebase (default) | serial | demo')
     args = ap.parse_args()
 
     print("="*55)
@@ -269,7 +292,10 @@ def main():
         now = time.time()
         if now - last_write >= WRITE_INTERVAL:
             db_write(args.id, Sphys, Svis, St, E, alert,
-                     bpm, spo2, gsr_norm, gsr_tonic, gsr_phasic, skin)
+                     bpm, spo2, gsr_norm, gsr_tonic, gsr_phasic, skin,
+                     gesture=signing.last_gesture if hasattr(signing, 'last_gesture') else None,
+                     is_signing=signing.is_signing,
+                     emotions=emotions if emotions else None)
             last_write = now
             sign_tag = " [SIGNING]" if signing.is_signing else ""
             print(f"  [DB] {args.id}  St={St:.3f}  "
